@@ -369,16 +369,18 @@ def correct_and_save_tiff(
     corrected = img / correction_factor
 
     # Add custom metadata
+    # Use private TIFF tags to avoid KeyError with custom tag names
+    # 65000: AcquisitionTime, 65001: BeamCorrectionFactor, 65002: MeanTPXModifiedTime
     extratags = [
-        ("BeamCorrectionFactor", "d", 1, float(correction_factor), False),
+        (65001, "d", 1, float(correction_factor), False),
     ]
     if acquisition_time is not None:
         extratags.append(
-            ("AcquisitionTime", "s", 0, acquisition_time.strftime("%Y-%m-%d %H:%M:%S"), False)
+            (65000, "s", 0, acquisition_time.strftime("%Y-%m-%d %H:%M:%S"), False)
         )
     if mean_tpx_modified_time is not None:
         extratags.append(
-            ("MeanTPXModifiedTime", "s", 0, mean_tpx_modified_time.strftime("%Y-%m-%d %H:%M:%S"), False)
+            (65002, "s", 0, mean_tpx_modified_time.strftime("%Y-%m-%d %H:%M:%S"), False)
         )
 
     tifffile.imwrite(
@@ -571,7 +573,7 @@ def copy_tiff_with_metadata(src_path, dst_path, mean_tpx_modified_time=None):
     extratags = []
     if mean_tpx_modified_time is not None:
         extratags.append(
-            ("MeanTPXModifiedTime", "s", 0, mean_tpx_modified_time.strftime("%Y-%m-%d %H:%M:%S"), False)
+            (65002, "s", 0, mean_tpx_modified_time.strftime("%Y-%m-%d %H:%M:%S"), False)
         )
 
     tifffile.imwrite(
