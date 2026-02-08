@@ -10,25 +10,56 @@ import warnings
 # Beam history loader
 # =============================================================================
 """
-Load a beam history .dat file into a pandas DataFrame.
+Load a beam history file into a pandas DataFrame.
+
+The first column is treated as the start timestamp of each interval, and the
+second column is treated as the average beam value for the interval from this
+row's time to the next row's time.
 
 Parameters
 ----------
 path : str
-    Path to the .dat file containing beam history data.
+    Path to the beam history file.
 
 Returns
 -------
 pd.DataFrame
     DataFrame with columns:
-    - 'timestamp' (datetime): timestamps of beam measurements
-    - 'beam_count' (int/float): recorded beam counts
+    - 'timestamp' (datetime): interval start timestamps
+    - 'beam_count' (float): average beam value for the interval
     The DataFrame is sorted by timestamp.
 """
 def load_beamhistory(path):
-    df = pd.read_csv(path, sep=" ", header=None, names=["timestamp", "beam_count"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], format="%Y-%m-%d.%H:%M:%S")
-    return df.sort_values("timestamp").reset_index(drop=True)
+    df = pd.read_csv(path, header=None, engine="python", sep=None)
+
+    ts = pd.to_datetime(df.iloc[:, 0], format="%m/%d/%Y %I:%M:%S %p", errors="coerce")
+    beam_col_idx = 1
+
+    if ts.isna().all() and df.shape[1] >= 3:
+        ts = pd.to_datetime(
+            df.iloc[:, 0].astype(str) + " " + df.iloc[:, 1].astype(str) + " " + df.iloc[:, 2].astype(str),
+            format="%m/%d/%Y %I:%M:%S %p",
+            errors="coerce",
+        )
+        beam_col_idx = 3
+    elif ts.isna().all() and df.shape[1] >= 2:
+        ts = pd.to_datetime(
+            df.iloc[:, 0].astype(str) + " " + df.iloc[:, 1].astype(str),
+            errors="coerce",
+        )
+        beam_col_idx = 2
+
+    if ts.isna().all():
+        raise ValueError(
+            "Could not parse timestamps from the first columns. "
+            "Expected format like '12/1/2025 4:00:10 AM'."
+        )
+
+    beam_vals = pd.to_numeric(df.iloc[:, beam_col_idx], errors="coerce")
+
+    out = pd.DataFrame({"timestamp": ts, "beam_count": beam_vals})
+    out = out.dropna(subset=["timestamp"]).reset_index(drop=True)
+    return out.sort_values("timestamp").reset_index(drop=True)
 
 
 # =============================================================================
@@ -166,10 +197,13 @@ def validate_beamhistory_coverage(
 
 
 # =============================================================================
-# Integrate beam counts over exposure windows (average per minute)
+# Integrate beam counts over exposure windows (time-weighted, per minute)
 # =============================================================================
 """
 Compute average beam integral per minute for each exposure window.
+
+This uses time-weighting: each beam_count value is treated as the average
+over the interval from its timestamp to the next timestamp.
 
 Parameters
 ----------
@@ -186,13 +220,42 @@ np.ndarray
     Array of average beam integrals (per minute) for each exposure.
 """
 def integrate_beam(beamhistory, exposure_times, exposure_seconds=5):
+    if len(exposure_times) == 0:
+        return np.array([])
+
+    ts = beamhistory["timestamp"]
+    next_ts = ts.shift(-1)
+    beam = pd.to_numeric(beamhistory["beam_count"], errors="coerce")
+
+    valid = next_ts.notna() & beam.notna()
+    ts = ts[valid].reset_index(drop=True)
+    next_ts = next_ts[valid].reset_index(drop=True)
+    beam = beam[valid].astype(float).reset_index(drop=True)
+
+    ts_ns = ts.values.astype("datetime64[ns]").astype("int64")
+    next_ns = next_ts.values.astype("datetime64[ns]").astype("int64")
+
     beam_integrals_per_min = []
     for t_end in exposure_times:
         t_start = t_end - timedelta(seconds=exposure_seconds)
-        mask = (beamhistory["timestamp"] >= t_start) & (beamhistory["timestamp"] <= t_end)
-        window_sum = beamhistory.loc[mask, "beam_count"].sum()
+        t_start_ns = np.int64(pd.Timestamp(t_start).value)
+        t_end_ns = np.int64(pd.Timestamp(t_end).value)
+
+        overlap_start = np.maximum(ts_ns, t_start_ns)
+        overlap_end = np.minimum(next_ns, t_end_ns)
+        dur_ns = overlap_end - overlap_start
+        dur_ns[dur_ns < 0] = 0
+
+        dur_sec = dur_ns / 1e9
+        window_sum = np.sum(beam.values * dur_sec)
         per_min = window_sum / exposure_seconds * 60.0
         beam_integrals_per_min.append(per_min)
+        if np.all(dur_sec == 0):
+            warnings.warn(
+                f"No beam history overlap for exposure window {t_start} to {t_end}. "
+                "Beam integral set to 0 for this window."
+            )
+
     return np.array(beam_integrals_per_min)
 
 
