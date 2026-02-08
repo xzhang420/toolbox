@@ -500,7 +500,7 @@ Parameters
 exp_dir : str
     Root directory containing run folders (e.g., exp604_..._00075).
 output_folder_name : str, optional
-    Name of output folder created alongside exp_dir (default "uncorrected_tiffs_prefixed").
+    Name of output folder created alongside exp_dir.
 final_subfolder : str, optional
     Subfolder name containing TIFF files (default "final").
 tiff_extensions : tuple of str, optional
@@ -596,7 +596,7 @@ beamhistory_path : str
     Path to the .dat file containing beam history for operando data.
 output_dir : str, optional
     Directory where corrected images will be saved. If None, creates a
-    "corrected_tiffs" folder alongside exp_dir.
+    "corrected_tiffs_<experiment_folder_name>" folder alongside exp_dir.
 exposure_seconds : int or float, optional
     Duration of each exposure in seconds (default 2).
 reference_dir : str
@@ -604,8 +604,8 @@ reference_dir : str
 reference_beamhistory_path : str
     Path to the .dat file containing beam history for the reference data.
 uncorrected_output_folder_name : str, optional
-    Output folder name for uncorrected prefixed TIFFs
-    (default "uncorrected_tiffs_prefixed").
+    Output folder name for uncorrected TIFFs. If None, creates a
+    "uncorrected_tiffs_<experiment_folder_name>" folder alongside exp_dir.
 
 Returns
 -------
@@ -619,7 +619,7 @@ def run_operando_pipeline(
     exposure_seconds=2,
     reference_dir=None,
     reference_beamhistory_path=None,
-    uncorrected_output_folder_name="uncorrected_tiffs_prefixed",
+    uncorrected_output_folder_name=None,
 ):
     if reference_dir is None or reference_beamhistory_path is None:
         raise ValueError(
@@ -627,9 +627,10 @@ def run_operando_pipeline(
             "reference_beam_integral_per_minute."
         )
 
+    exp_name = os.path.basename(os.path.abspath(exp_dir))
     if output_dir is None:
         parent_dir = os.path.dirname(os.path.abspath(exp_dir))
-        output_dir = os.path.join(parent_dir, "corrected_tiffs")
+        output_dir = os.path.join(parent_dir, f"corrected_tiffs_{exp_name}")
     os.makedirs(output_dir, exist_ok=True)
 
     reference_beam_integral_per_minute = compute_reference_beam_integral_per_minute(
@@ -638,6 +639,8 @@ def run_operando_pipeline(
         exposure_seconds,
     )
 
+    if uncorrected_output_folder_name is None:
+        uncorrected_output_folder_name = f"uncorrected_tiffs_{exp_name}"
     uncorrected_dir = collect_and_copy_tiffs(
         exp_dir,
         output_folder_name=uncorrected_output_folder_name,
