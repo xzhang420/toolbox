@@ -113,6 +113,25 @@ def mean_datetime(times):
 
 
 # =============================================================================
+# TIFF helpers
+# =============================================================================
+"""
+Check whether a file is a TIFF image, allowing extensionless TIFFs.
+"""
+def is_tiff_file(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".tif", ".tiff"):
+        return True
+    if ext == "":
+        try:
+            with tifffile.TiffFile(path):
+                return True
+        except Exception:
+            return False
+    return False
+
+
+# =============================================================================
 # Run-level beam metrics
 # =============================================================================
 """
@@ -477,7 +496,13 @@ def intensity_correct_experiment(
             run_beam_integral_per_minute, reference_beam_integral_per_minute
         )
 
-        image_files = sorted(os.listdir(image_dir_run))
+        image_files = [
+            f for f in sorted(os.listdir(image_dir_run))
+            if is_tiff_file(os.path.join(image_dir_run, f))
+        ]
+        if len(image_files) == 0:
+            warnings.warn(f"No TIFF images found in {image_dir_run}; skipping run.")
+            continue
 
         for img_file in image_files:
             src = os.path.join(image_dir_run, img_file)
@@ -535,7 +560,13 @@ def collect_and_copy_tiffs(
         exposure_times = get_exposure_times(tpx_folder) if os.path.isdir(tpx_folder) else []
         mean_tpx_time = mean_datetime(exposure_times) if exposure_times else None
 
-        tiff_files = [f for f in sorted(os.listdir(final_dir)) if f.lower().endswith(tiff_extensions)]
+        tiff_files = [
+            f for f in sorted(os.listdir(final_dir))
+            if is_tiff_file(os.path.join(final_dir, f))
+        ]
+        if len(tiff_files) == 0:
+            warnings.warn(f"No TIFF images found in {final_dir}; skipping run.")
+            continue
         if not exposure_times:
             warnings.warn(
                 f"No TPX files found for run {run_dir}; uncorrected copies will "
