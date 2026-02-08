@@ -125,7 +125,7 @@ beamhistory : pd.DataFrame
 tpx_folder : str
     Folder containing TPX files for a run.
 exposure_seconds : int or float, optional
-    Duration of each exposure in seconds (default is 5).
+    Duration of each exposure in seconds (default is 2).
 context : str, optional
     Label used in error messages to identify the dataset.
 
@@ -134,7 +134,7 @@ Returns
 tuple
     (mean_beam_integral_per_minute, mean_tpx_modified_time)
 """
-def compute_run_metrics(beamhistory, tpx_folder, exposure_seconds=5, context=None):
+def compute_run_metrics(beamhistory, tpx_folder, exposure_seconds=2, context=None):
     exposure_times = get_exposure_times(tpx_folder)
     if len(exposure_times) == 0:
         return np.nan, None
@@ -164,7 +164,7 @@ beamhistory : pd.DataFrame
 exposure_times : list of datetime.datetime
     End times of each exposure.
 exposure_seconds : int or float, optional
-    Duration of each exposure in seconds (default is 5).
+    Duration of each exposure in seconds (default is 2).
 context : str, optional
     Label used in error messages to identify the dataset.
 
@@ -212,14 +212,14 @@ beamhistory : pd.DataFrame
 exposure_times : list of datetime.datetime
     End times of each exposure.
 exposure_seconds : int or float, optional
-    Duration of each exposure in seconds (default is 5).
+    Duration of each exposure in seconds (default is 2).
 
 Returns
 -------
 np.ndarray
     Array of average beam integrals (per minute) for each exposure.
 """
-def integrate_beam(beamhistory, exposure_times, exposure_seconds=5):
+def integrate_beam(beamhistory, exposure_times, exposure_seconds=2):
     if len(exposure_times) == 0:
         return np.array([])
 
@@ -294,7 +294,7 @@ reference_dir : str
 reference_beamhistory_path : str
     Path to the .dat file containing beam history for the reference data.
 exposure_seconds : int or float, optional
-    Duration of each exposure in seconds (default is 5).
+    Duration of each exposure in seconds (default is 2).
 
 Returns
 -------
@@ -304,7 +304,7 @@ float
 def compute_reference_beam_integral_per_minute(
     reference_dir,
     reference_beamhistory_path,
-    exposure_seconds=5,
+    exposure_seconds=2,
 ):
     beamhistory = load_beamhistory(reference_beamhistory_path)
 
@@ -406,7 +406,7 @@ output_dir : str
 beamhistory_path : str
     Path to the .dat file containing the beam history.
 exposure_seconds : int or float, optional
-    Duration of each exposure in seconds (default 5).
+    Duration of each exposure in seconds (default 2).
 reference_beam_integral_per_minute : float, optional
     Reference beam integral per minute used to normalize images. If not
     provided, it will be computed from reference data.
@@ -429,7 +429,7 @@ def intensity_correct_experiment(
     image_dir=None,
     output_dir=None,
     beamhistory_path=None,
-    exposure_seconds=5,
+    exposure_seconds=2,
     reference_beam_integral_per_minute=None,
     reference_dir=None,
     reference_beamhistory_path=None,
@@ -480,7 +480,8 @@ def intensity_correct_experiment(
 
         for img_file in image_files:
             src = os.path.join(image_dir_run, img_file)
-            dst = os.path.join(output_dir, img_file)
+            dst_name = f"{run_dir}_corrected_{img_file}"
+            dst = os.path.join(output_dir, dst_name)
 
             correct_and_save_tiff(
                 src, dst, correction_factor, mean_tpx_time, mean_tpx_time
@@ -508,9 +509,9 @@ tiff_extensions : tuple of str, optional
 Returns
 -------
 str
-    Path to the output folder containing copied and prefixed TIFFs.
+    Path to the output folder containing copied TIFFs with run-prefixed filenames.
 """
-def collect_and_prefix_tiffs(
+def collect_and_copy_tiffs(
     exp_dir,
     output_folder_name="uncorrected_tiffs_prefixed",
     final_subfolder="final",
@@ -597,7 +598,7 @@ output_dir : str, optional
     Directory where corrected images will be saved. If None, creates a
     "corrected_tiffs" folder alongside exp_dir.
 exposure_seconds : int or float, optional
-    Duration of each exposure in seconds (default 5).
+    Duration of each exposure in seconds (default 2).
 reference_dir : str
     Root directory containing reference runs (same structure as operando data).
 reference_beamhistory_path : str
@@ -615,7 +616,7 @@ def run_operando_pipeline(
     exp_dir,
     beamhistory_path,
     output_dir=None,
-    exposure_seconds=5,
+    exposure_seconds=2,
     reference_dir=None,
     reference_beamhistory_path=None,
     uncorrected_output_folder_name="uncorrected_tiffs_prefixed",
@@ -637,7 +638,7 @@ def run_operando_pipeline(
         exposure_seconds,
     )
 
-    uncorrected_dir = collect_and_prefix_tiffs(
+    uncorrected_dir = collect_and_copy_tiffs(
         exp_dir,
         output_folder_name=uncorrected_output_folder_name,
     )
