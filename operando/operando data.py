@@ -293,8 +293,6 @@ reference_dir : str
     Root directory containing reference runs (same structure as operando data).
 reference_beamhistory_path : str
     Path to the .dat file containing beam history for the reference data.
-reference_tpx_subfolder : str, optional
-    Name of the subfolder inside each run containing TPX files (default "tpx3Files").
 exposure_seconds : int or float, optional
     Duration of each exposure in seconds (default is 5).
 
@@ -306,14 +304,13 @@ float
 def compute_reference_beam_integral_per_minute(
     reference_dir,
     reference_beamhistory_path,
-    reference_tpx_subfolder="tpx3Files",
     exposure_seconds=5,
 ):
     beamhistory = load_beamhistory(reference_beamhistory_path)
 
     all_beam_integrals = []
     for run_dir in sorted(os.listdir(reference_dir)):
-        tpx_folder = os.path.join(reference_dir, run_dir, reference_tpx_subfolder)
+        tpx_folder = os.path.join(reference_dir, run_dir, "tpx3Files")
         if not os.path.isdir(tpx_folder):
             continue
 
@@ -402,8 +399,6 @@ Parameters
 ----------
 exp_dir : str
     Root directory containing experiment runs (subfolders with TPX files).
-tpx_subfolder : str, optional
-    Name of the subfolder inside each run containing TPX files (default "tpx3Files").
 image_dir : str
     Directory containing the original images to correct.
 output_dir : str
@@ -419,9 +414,6 @@ reference_dir : str
     Root directory containing reference runs (same structure as operando data).
 reference_beamhistory_path : str
     Path to the .dat file containing beam history for the reference data.
-reference_tpx_subfolder : str, optional
-    Name of the subfolder inside each reference run containing TPX files
-    (default "tpx3Files").
 
 Notes
 -----
@@ -434,7 +426,6 @@ For each run, this function:
 """
 def intensity_correct_experiment(
     exp_dir,
-    tpx_subfolder="tpx3Files",
     image_dir=None,
     output_dir=None,
     beamhistory_path=None,
@@ -442,7 +433,6 @@ def intensity_correct_experiment(
     reference_beam_integral_per_minute=None,
     reference_dir=None,
     reference_beamhistory_path=None,
-    reference_tpx_subfolder="tpx3Files",
 ):
     beamhistory = load_beamhistory(beamhistory_path)
 
@@ -451,7 +441,6 @@ def intensity_correct_experiment(
             reference_beam_integral_per_minute = compute_reference_beam_integral_per_minute(
                 reference_dir,
                 reference_beamhistory_path,
-                reference_tpx_subfolder,
                 exposure_seconds,
             )
         else:
@@ -465,7 +454,7 @@ def intensity_correct_experiment(
         )
 
     for run_dir in sorted(os.listdir(exp_dir)):
-        tpx_folder = os.path.join(exp_dir, run_dir, tpx_subfolder)
+        tpx_folder = os.path.join(exp_dir, run_dir, "tpx3Files")
         if not os.path.isdir(tpx_folder):
             continue
 
@@ -513,8 +502,6 @@ output_folder_name : str, optional
     Name of output folder created alongside exp_dir (default "uncorrected_tiffs_prefixed").
 final_subfolder : str, optional
     Subfolder name containing TIFF files (default "final").
-tpx_subfolder : str, optional
-    Subfolder name containing TPX files (default "tpx3Files").
 tiff_extensions : tuple of str, optional
     TIFF extensions to include (default (".tif", ".tiff")).
 
@@ -527,7 +514,6 @@ def collect_and_prefix_tiffs(
     exp_dir,
     output_folder_name="uncorrected_tiffs_prefixed",
     final_subfolder="final",
-    tpx_subfolder="tpx3Files",
     tiff_extensions=(".tif", ".tiff"),
 ):
     parent_dir = os.path.dirname(os.path.abspath(exp_dir))
@@ -543,7 +529,7 @@ def collect_and_prefix_tiffs(
         if not os.path.isdir(final_dir):
             continue
 
-        tpx_folder = os.path.join(run_path, tpx_subfolder)
+        tpx_folder = os.path.join(run_path, "tpx3Files")
         exposure_times = get_exposure_times(tpx_folder) if os.path.isdir(tpx_folder) else []
         mean_tpx_time = mean_datetime(exposure_times) if exposure_times else None
 
@@ -616,9 +602,6 @@ reference_dir : str
     Root directory containing reference runs (same structure as operando data).
 reference_beamhistory_path : str
     Path to the .dat file containing beam history for the reference data.
-reference_tpx_subfolder : str, optional
-    Name of the subfolder inside each reference run containing TPX files
-    (default "tpx3Files").
 uncorrected_output_folder_name : str, optional
     Output folder name for uncorrected prefixed TIFFs
     (default "uncorrected_tiffs_prefixed").
@@ -635,7 +618,6 @@ def run_operando_pipeline(
     exposure_seconds=5,
     reference_dir=None,
     reference_beamhistory_path=None,
-    reference_tpx_subfolder="tpx3Files",
     uncorrected_output_folder_name="uncorrected_tiffs_prefixed",
 ):
     if reference_dir is None or reference_beamhistory_path is None:
@@ -652,7 +634,6 @@ def run_operando_pipeline(
     reference_beam_integral_per_minute = compute_reference_beam_integral_per_minute(
         reference_dir,
         reference_beamhistory_path,
-        reference_tpx_subfolder,
         exposure_seconds,
     )
 
@@ -670,7 +651,6 @@ def run_operando_pipeline(
         reference_beam_integral_per_minute=reference_beam_integral_per_minute,
         reference_dir=reference_dir,
         reference_beamhistory_path=reference_beamhistory_path,
-        reference_tpx_subfolder=reference_tpx_subfolder,
     )
 
     return {
