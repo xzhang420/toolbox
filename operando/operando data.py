@@ -365,7 +365,6 @@ def correct_and_save_tiff(
 ):
     with tifffile.TiffFile(src_path) as tif:
         img = tif.asarray()
-        metadata = tif.pages[0].tags.asdict()
 
     corrected = img / correction_factor
 
