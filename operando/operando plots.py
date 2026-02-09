@@ -168,8 +168,8 @@ def load_echem_data(root_folder, conv_thickness=1.0, time_column="time/s"):
     -------
     datetime_series : list of datetime.datetime
         Time series as datetime objects
-    voltage_series : np.ndarray
-        Ewe/V series
+    potential_series : np.ndarray
+        Ewe/V series (potential)
     echem_thickness_series : np.ndarray
         Thickness series calculated from capacity
     """
@@ -223,13 +223,13 @@ def load_echem_data(root_folder, conv_thickness=1.0, time_column="time/s"):
     sorted_idx = np.argsort(datetime_series)
 
     datetime_series = [datetime_series[i] for i in sorted_idx]
-    voltage_series = combined["Ewe/V"].to_numpy(dtype=float)[sorted_idx]
+    potential_series = combined["Ewe/V"].to_numpy(dtype=float)[sorted_idx]
     echem_thickness_series = (
         combined["Capacity/mA.h"].to_numpy(dtype=float)[sorted_idx]
         * conv_thickness
     )
 
-    return datetime_series, voltage_series, echem_thickness_series
+    return datetime_series, potential_series, echem_thickness_series
 
 
 
@@ -287,9 +287,9 @@ def process_reference_images(
         ref_avg, bin_y=bin_y, bin_x=bin_x, target_shape=ref_series[0].shape
     )
     return ref_processed
-def make_voltage_image_video_uniform_time(
+def make_potential_image_video_uniform_time(
     echem_datetimes,
-    voltage_series,
+    potential_series,
     img_datetimes,
     img_series,
     output_path,
@@ -299,9 +299,10 @@ def make_voltage_image_video_uniform_time(
     cmap="inferno",
     vmin=None,
     vmax=None,
+    potential_ylim=None,
 ):
     """
-    Create a synchronized voltage–image video using a uniform global time axis.
+    Create a synchronized potential–image video using a uniform global time axis.
 
     Potential: zero-order hold (previous value)
     Image: nearest in time
@@ -309,7 +310,7 @@ def make_voltage_image_video_uniform_time(
     Parameters
     ----------
     echem_datetimes : list of datetime.datetime
-    voltage_series : np.ndarray
+    potential_series : np.ndarray
     img_datetimes : list of datetime.datetime
     img_series : list of 2D np.ndarray
     output_path : str
@@ -328,13 +329,13 @@ def make_voltage_image_video_uniform_time(
     """
 
     # ------------------------------------------------------------------
-    # Limit voltage series to the time range covered by images
+    # Limit potential series to the time range covered by images
     # ------------------------------------------------------------------
     img_start = min(img_datetimes)
     img_end = max(img_datetimes)
     echem_mask = [(t >= img_start) and (t <= img_end) for t in echem_datetimes]
     echem_datetimes = [t for t, m in zip(echem_datetimes, echem_mask) if m]
-    voltage_series = np.asarray(voltage_series)[np.array(echem_mask, dtype=bool)]
+    potential_series = np.asarray(potential_series)[np.array(echem_mask, dtype=bool)]
 
     if len(echem_datetimes) == 0:
         raise ValueError("No electrochemical data within image time range.")
@@ -363,10 +364,10 @@ def make_voltage_image_video_uniform_time(
     # ------------------------------------------------------------------
     # Helper lookups
     # ------------------------------------------------------------------
-    def voltage_at(t):
-        """Zero-order hold voltage."""
+    def potential_at(t):
+        """Zero-order hold potential."""
         i = bisect_right(echem_t, t) - 1
-        return voltage_series[i] if i >= 0 else voltage_series[0]
+        return potential_series[i] if i >= 0 else potential_series[0]
 
     def nearest_image_index(t):
         i = bisect_right(img_t, t)
@@ -387,12 +388,14 @@ def make_voltage_image_video_uniform_time(
     )
 
     # Potential curve (static)
-    ax_v.plot(echem_t_h, voltage_series, lw=1.5)
+    ax_v.plot(echem_t_h, potential_series, lw=1.5)
     marker, = ax_v.plot([], [], "ro", ms=6)
 
     ax_v.set_xlabel("Time (h)")
     ax_v.set_ylabel("Potential (V)")
     ax_v.set_title("Potential evolution")
+    if potential_ylim is not None:
+        ax_v.set_ylim(potential_ylim)
 
     # Image
     im = ax_img.imshow(
@@ -416,7 +419,7 @@ def make_voltage_image_video_uniform_time(
         for t in anim_t:
 
             # Potential (ZOH)
-            v = voltage_at(t)
+            v = potential_at(t)
             marker.set_data(t / 3600.0, v)
 
             # Image (nearest)
@@ -565,7 +568,7 @@ def make_echem_neutron_video(
     # Load data
     # ------------------------------------------------------------
     img_dt, img_series, _ = load_images(image_folder, **image_kwargs)
-    echem_dt, voltage, _ = load_echem_data(
+    echem_dt, potential, _ = load_echem_data(
         echem_folder,
         conv_thickness=conv_thickness,
     )
@@ -600,9 +603,9 @@ def make_echem_neutron_video(
     # ------------------------------------------------------------
     # Lookup helpers
     # ------------------------------------------------------------
-    def voltage_at(t):
+    def potential_at(t):
         i = bisect_right(echem_t, t) - 1
-        return voltage[i] if i >= 0 else voltage[0]
+        return potential[i] if i >= 0 else potential[0]
 
     def nearest_image_index(t):
         i = bisect_right(img_t, t)
@@ -621,7 +624,7 @@ def make_echem_neutron_video(
     )
 
     echem_t_h = echem_t / 3600.0
-    ax_v.plot(echem_t_h, voltage, lw=1.5)
+    ax_v.plot(echem_t_h, potential, lw=1.5)
     marker, = ax_v.plot([], [], "ro", ms=6)
     ax_v.set_xlabel("Time (h)")
     ax_v.set_ylabel("Potential (V)")
@@ -647,7 +650,7 @@ def make_echem_neutron_video(
     with writer.saving(fig, output_path, dpi=dpi):
         for t in t_anim:
 
-            marker.set_data(t / 3600.0, voltage_at(t))
+            marker.set_data(t / 3600.0, potential_at(t))
 
             j = nearest_image_index(t)
             im.set_data(img_series[j])
@@ -732,16 +735,17 @@ def circular_average_thickness_series(img_series, x0=None, y0=None, r0=None):
 import numpy as np
 import matplotlib.pyplot as plt
 
-def plot_voltage_and_thickness(
+def plot_potential_and_thickness(
     echem_datetime_series,
-    voltage_series,
+    potential_series,
     echem_thickness_series=None,
     img_datetime_series=None,
     avg_thickness_series=None,
     plot_thickness=False,
+    potential_ylim=None,
 ):
     """
-    Plot voltage, electrochemical thickness, and image-derived average thickness
+    Plot potential, electrochemical thickness, and image-derived average thickness
     on a common time axis (elapsed time from earliest overlapping time).
 
     Time ranges where only electrochemical data exists (before or after image data)
@@ -752,7 +756,7 @@ def plot_voltage_and_thickness(
     echem_datetime_series = np.asarray(echem_datetime_series)
     img_datetime_series = np.asarray(img_datetime_series)
 
-    voltage_series = np.asarray(voltage_series)
+    potential_series = np.asarray(potential_series)
     if plot_thickness:
         if echem_thickness_series is None or img_datetime_series is None or avg_thickness_series is None:
             raise ValueError("Thickness plotting requires echem_thickness_series, img_datetime_series, and avg_thickness_series.")
@@ -766,7 +770,7 @@ def plot_voltage_and_thickness(
         # ---- Mask electrochemical data to image time window ----
         echem_mask = (echem_datetime_series >= t_start) & (echem_datetime_series <= t_end)
         echem_datetime_series = echem_datetime_series[echem_mask]
-        voltage_series = voltage_series[echem_mask]
+        potential_series = potential_series[echem_mask]
         if plot_thickness:
             echem_thickness_series = echem_thickness_series[echem_mask]
     else:
@@ -784,10 +788,12 @@ def plot_voltage_and_thickness(
     fig, ax1 = plt.subplots(figsize=(8, 4.5))
 
     # Potential (left axis)
-    ax1.plot(t_echem, voltage_series, label="Potential (Ewe/V)")
+    ax1.plot(t_echem, potential_series, label="Potential (Ewe/V)")
     ax1.set_xlabel("Time elapsed (h)")
     ax1.set_ylabel("Potential (V)")
     ax1.tick_params(axis="y")
+    if potential_ylim is not None:
+        ax1.set_ylim(potential_ylim)
 
     # Thickness (right axis)
     if plot_thickness:
