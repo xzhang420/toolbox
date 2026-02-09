@@ -206,7 +206,7 @@ def load_echem_data(root_folder, conv_thickness=1.0, time_column="time/s"):
 
     datetime_series = []
     if isinstance(sample_val, str):
-        # Datetime string with optional sub-second precision
+        # Datetime string with optional sub-second precision (DD/MM/YYYY)
         for val in combined[time_column]:
             dt_str = str(val).split(".")[0]  # drop fractional seconds
             dt = datetime.strptime(dt_str, "%d/%m/%Y %H:%M:%S")
