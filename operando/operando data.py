@@ -195,7 +195,7 @@ ValueError
 def validate_beamhistory_coverage(
     beamhistory,
     exposure_times,
-    exposure_seconds=5,
+    exposure_seconds=2,
     context="operando",
 ):
     if len(exposure_times) == 0:
@@ -504,13 +504,21 @@ def intensity_correct_experiment(
             warnings.warn(f"No TIFF images found in {image_dir_run}; skipping run.")
             continue
 
+        skipped_in_run = 0
         for img_file in image_files:
             src = os.path.join(image_dir_run, img_file)
             dst_name = f"{run_dir}_corrected_{img_file}"
             dst = os.path.join(output_dir, dst_name)
+            if os.path.exists(dst):
+                skipped_in_run += 1
+                continue
 
             correct_and_save_tiff(
                 src, dst, correction_factor, mean_tpx_time, mean_tpx_time
+            )
+        if skipped_in_run:
+            warnings.warn(
+                f"Skipped {skipped_in_run} existing corrected files in run {run_dir}."
             )
 
 
