@@ -245,6 +245,48 @@ from bisect import bisect_right
 from datetime import timedelta
 
 
+def block_mean(img, bin_y=2, bin_x=2):
+    h, w = img.shape
+    h2 = (h // bin_y) * bin_y
+    w2 = (w // bin_x) * bin_x
+    cropped = img[:h2, :w2]
+    return cropped.reshape(h2 // bin_y, bin_y, w2 // bin_x, bin_x).mean(axis=(1, 3))
+
+
+def upsample_nearest(img, bin_y=2, bin_x=2, target_shape=None):
+    up = np.repeat(np.repeat(img, bin_y, axis=0), bin_x, axis=1)
+    if target_shape is not None:
+        return up[:target_shape[0], :target_shape[1]]
+    return up
+
+
+def process_reference_images(
+    ref_series,
+    bin_y=2,
+    bin_x=2,
+):
+    """
+    1) Bin each reference image (smoothing)
+    2) Average binned images
+    3) Clamp pixels below the global mean to the mean
+    4) Upsample back to original size for division
+    """
+    if len(ref_series) == 0:
+        raise ValueError("ref_series is empty.")
+
+    # bin each image first
+    binned = [block_mean(img, bin_y=bin_y, bin_x=bin_x) for img in ref_series]
+    ref_avg = np.mean(np.stack(binned, axis=0), axis=0)
+
+    # clamp below global mean
+    global_mean = float(np.mean(ref_avg))
+    ref_avg = np.maximum(ref_avg, global_mean)
+
+    # upsample back to original resolution
+    ref_processed = upsample_nearest(
+        ref_avg, bin_y=bin_y, bin_x=bin_x, target_shape=ref_series[0].shape
+    )
+    return ref_processed
 def make_voltage_image_video_uniform_time(
     echem_datetimes,
     voltage_series,
@@ -261,7 +303,7 @@ def make_voltage_image_video_uniform_time(
     """
     Create a synchronized voltage–image video using a uniform global time axis.
 
-    Voltage: zero-order hold (previous value)
+    Potential: zero-order hold (previous value)
     Image: nearest in time
 
     Parameters
@@ -304,6 +346,7 @@ def make_voltage_image_video_uniform_time(
 
     echem_t = np.array([(t - t0).total_seconds() for t in echem_datetimes])
     img_t = np.array([(t - t0).total_seconds() for t in img_datetimes])
+    echem_t_h = echem_t / 3600.0
 
     # ------------------------------------------------------------------
     # Define uniform animation time grid
@@ -343,13 +386,13 @@ def make_voltage_image_video_uniform_time(
         gridspec_kw={"width_ratios": [1.2, 1]}
     )
 
-    # Voltage curve (static)
-    ax_v.plot(echem_t, voltage_series, lw=1.5)
+    # Potential curve (static)
+    ax_v.plot(echem_t_h, voltage_series, lw=1.5)
     marker, = ax_v.plot([], [], "ro", ms=6)
 
-    ax_v.set_xlabel("Time (s)")
-    ax_v.set_ylabel("Voltage (V)")
-    ax_v.set_title("Voltage evolution")
+    ax_v.set_xlabel("Time (h)")
+    ax_v.set_ylabel("Potential (V)")
+    ax_v.set_title("Potential evolution")
 
     # Image
     im = ax_img.imshow(
@@ -372,9 +415,9 @@ def make_voltage_image_video_uniform_time(
     with writer.saving(fig, output_path, dpi=dpi):
         for t in anim_t:
 
-            # Voltage (ZOH)
+            # Potential (ZOH)
             v = voltage_at(t)
-            marker.set_data(t, v)
+            marker.set_data(t / 3600.0, v)
 
             # Image (nearest)
             j = nearest_image_index(t)
@@ -577,11 +620,12 @@ def make_echem_neutron_video(
         gridspec_kw={"width_ratios": [1.2, 1]},
     )
 
-    ax_v.plot(echem_t, voltage, lw=1.5)
+    echem_t_h = echem_t / 3600.0
+    ax_v.plot(echem_t_h, voltage, lw=1.5)
     marker, = ax_v.plot([], [], "ro", ms=6)
-    ax_v.set_xlabel("Time (s)")
-    ax_v.set_ylabel("Voltage (V)")
-    ax_v.set_title("Voltage evolution")
+    ax_v.set_xlabel("Time (h)")
+    ax_v.set_ylabel("Potential (V)")
+    ax_v.set_title("Potential evolution")
 
     im = ax_i.imshow(
         img_series[0],
@@ -603,7 +647,7 @@ def make_echem_neutron_video(
     with writer.saving(fig, output_path, dpi=dpi):
         for t in t_anim:
 
-            marker.set_data(t, voltage_at(t))
+            marker.set_data(t / 3600.0, voltage_at(t))
 
             j = nearest_image_index(t)
             im.set_data(img_series[j])
@@ -732,17 +776,17 @@ def plot_voltage_and_thickness(
     # ---- Define common time origin ----
     t0 = t_start
 
-    # ---- Convert datetimes to elapsed time (seconds) ----
-    t_echem = np.array([(t - t0).total_seconds() for t in echem_datetime_series])
-    t_img = np.array([(t - t0).total_seconds() for t in img_datetime_series])
+    # ---- Convert datetimes to elapsed time (hours) ----
+    t_echem = np.array([(t - t0).total_seconds() for t in echem_datetime_series]) / 3600.0
+    t_img = np.array([(t - t0).total_seconds() for t in img_datetime_series]) / 3600.0
 
     # ---- Plot ----
     fig, ax1 = plt.subplots(figsize=(8, 4.5))
 
-    # Voltage (left axis)
-    ax1.plot(t_echem, voltage_series, label="Voltage (Ewe/V)")
-    ax1.set_xlabel("Time elapsed (s)")
-    ax1.set_ylabel("Voltage (V)")
+    # Potential (left axis)
+    ax1.plot(t_echem, voltage_series, label="Potential (Ewe/V)")
+    ax1.set_xlabel("Time elapsed (h)")
+    ax1.set_ylabel("Potential (V)")
     ax1.tick_params(axis="y")
 
     # Thickness (right axis)
