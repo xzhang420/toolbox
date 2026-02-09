@@ -286,6 +286,18 @@ def make_voltage_image_video_uniform_time(
     """
 
     # ------------------------------------------------------------------
+    # Limit voltage series to the time range covered by images
+    # ------------------------------------------------------------------
+    img_start = min(img_datetimes)
+    img_end = max(img_datetimes)
+    echem_mask = [(t >= img_start) and (t <= img_end) for t in echem_datetimes]
+    echem_datetimes = [t for t, m in zip(echem_datetimes, echem_mask) if m]
+    voltage_series = np.asarray(voltage_series)[np.array(echem_mask, dtype=bool)]
+
+    if len(echem_datetimes) == 0:
+        raise ValueError("No electrochemical data within image time range.")
+
+    # ------------------------------------------------------------------
     # Convert datetimes to seconds (for speed & simplicity)
     # ------------------------------------------------------------------
     t0 = min(min(echem_datetimes), min(img_datetimes))
@@ -679,9 +691,10 @@ import matplotlib.pyplot as plt
 def plot_voltage_and_thickness(
     echem_datetime_series,
     voltage_series,
-    echem_thickness_series,
-    img_datetime_series,
-    avg_thickness_series,
+    echem_thickness_series=None,
+    img_datetime_series=None,
+    avg_thickness_series=None,
+    plot_thickness=False,
 ):
     """
     Plot voltage, electrochemical thickness, and image-derived average thickness
@@ -696,19 +709,25 @@ def plot_voltage_and_thickness(
     img_datetime_series = np.asarray(img_datetime_series)
 
     voltage_series = np.asarray(voltage_series)
-    echem_thickness_series = np.asarray(echem_thickness_series)
-    avg_thickness_series = np.asarray(avg_thickness_series)
+    if plot_thickness:
+        if echem_thickness_series is None or img_datetime_series is None or avg_thickness_series is None:
+            raise ValueError("Thickness plotting requires echem_thickness_series, img_datetime_series, and avg_thickness_series.")
+        echem_thickness_series = np.asarray(echem_thickness_series)
+        avg_thickness_series = np.asarray(avg_thickness_series)
 
     # ---- Determine overlapping time window ----
-    t_start = img_datetime_series.min()
-    t_end = img_datetime_series.max()
-
-    # ---- Mask electrochemical data to image time window ----
-    echem_mask = (echem_datetime_series >= t_start) & (echem_datetime_series <= t_end)
-
-    echem_datetime_series = echem_datetime_series[echem_mask]
-    voltage_series = voltage_series[echem_mask]
-    echem_thickness_series = echem_thickness_series[echem_mask]
+    if img_datetime_series is not None and len(img_datetime_series) > 0:
+        t_start = img_datetime_series.min()
+        t_end = img_datetime_series.max()
+        # ---- Mask electrochemical data to image time window ----
+        echem_mask = (echem_datetime_series >= t_start) & (echem_datetime_series <= t_end)
+        echem_datetime_series = echem_datetime_series[echem_mask]
+        voltage_series = voltage_series[echem_mask]
+        if plot_thickness:
+            echem_thickness_series = echem_thickness_series[echem_mask]
+    else:
+        t_start = echem_datetime_series.min()
+        t_end = echem_datetime_series.max()
 
     # ---- Define common time origin ----
     t0 = t_start
@@ -727,15 +746,18 @@ def plot_voltage_and_thickness(
     ax1.tick_params(axis="y")
 
     # Thickness (right axis)
-    ax2 = ax1.twinx()
-    ax2.plot(t_echem, echem_thickness_series, label="EC thickness")
-    ax2.plot(t_img, avg_thickness_series, label="Image avg thickness")
-    ax2.set_ylabel("Thickness (a.u.)")
+    if plot_thickness:
+        ax2 = ax1.twinx()
+        ax2.plot(t_echem, echem_thickness_series, label="EC thickness")
+        ax2.plot(t_img, avg_thickness_series, label="Image avg thickness")
+        ax2.set_ylabel("Thickness (a.u.)")
 
-    # ---- Legend handling ----
-    lines_1, labels_1 = ax1.get_legend_handles_labels()
-    lines_2, labels_2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc="best")
+        # ---- Legend handling ----
+        lines_1, labels_1 = ax1.get_legend_handles_labels()
+        lines_2, labels_2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc="best")
+    else:
+        ax1.legend(loc="best")
 
     plt.tight_layout()
     plt.show()
