@@ -629,6 +629,7 @@ def find_capacity_turning_points_and_zeros(
     echem_datetimes,
     capacity_series,
     zero_tol=1e-9,
+    only_initial_zero=True,
 ):
     """
     Find timestamps of turning points and zero crossings in Capacity/mA.h.
@@ -664,6 +665,9 @@ def find_capacity_turning_points_and_zeros(
         prod = np.nan_to_num(sign[:-1]) * np.nan_to_num(sign[1:])
         sign_change_idx = set((np.where(prod < 0)[0] + 1).tolist())
         zero_idx |= sign_change_idx
+
+    if only_initial_zero and zero_idx:
+        zero_idx = {min(zero_idx)}
 
     for idx in zero_idx:
         labels_by_idx.setdefault(idx, set()).add("zero")
