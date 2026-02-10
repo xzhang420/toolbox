@@ -710,9 +710,14 @@ def find_nearest_image_indices(event_times, img_datetimes):
     if len(img_times) == 0:
         return []
     indices = []
+    seen = set()
     for t in event_times:
         deltas = np.abs(img_times - t)
-        indices.append(int(np.argmin(deltas)))
+        idx = int(np.argmin(deltas))
+        if idx in seen:
+            continue
+        seen.add(idx)
+        indices.append(idx)
     return indices
 
 
