@@ -547,7 +547,7 @@ str
 """
 def collect_and_copy_tiffs(
     exp_dir,
-    output_folder_name="uncorrected_tiffs_prefixed",
+    output_folder_name="uncorrected",
     final_subfolder="final",
     tiff_extensions=(".tif", ".tiff"),
 ):
@@ -635,8 +635,8 @@ exp_dir : str
 beamhistory_path : str
     Path to the .dat file containing beam history for operando data.
 output_dir : str, optional
-    Directory where corrected images will be saved. If None, creates a
-    "corrected_tiffs_<experiment_folder_name>" folder alongside exp_dir.
+    Directory where corrected images will be saved. If None, creates an
+    "obint_corrected_<experiment_folder_name>" folder alongside exp_dir.
 exposure_seconds : int or float, optional
     Duration of each exposure in seconds (default 2).
 reference_dir : str
@@ -644,8 +644,8 @@ reference_dir : str
 reference_beamhistory_path : str
     Path to the .dat file containing beam history for the reference data.
 uncorrected_output_folder_name : str, optional
-    Output folder name for uncorrected TIFFs. If None, creates a
-    "uncorrected_tiffs_<experiment_folder_name>" folder alongside exp_dir.
+    Output folder name for uncorrected TIFFs. If None, creates an
+    "uncorrected_<experiment_folder_name>" folder alongside exp_dir.
 
 Returns
 -------
@@ -670,7 +670,7 @@ def run_operando_pipeline(
     exp_name = os.path.basename(os.path.abspath(exp_dir))
     if output_dir is None:
         parent_dir = os.path.dirname(os.path.abspath(exp_dir))
-        output_dir = os.path.join(parent_dir, f"corrected_tiffs_{exp_name}")
+        output_dir = os.path.join(parent_dir, f"obint_corrected_{exp_name}")
     os.makedirs(output_dir, exist_ok=True)
 
     reference_beam_integral_per_minute = compute_reference_beam_integral_per_minute(
@@ -680,7 +680,7 @@ def run_operando_pipeline(
     )
 
     if uncorrected_output_folder_name is None:
-        uncorrected_output_folder_name = f"uncorrected_tiffs_{exp_name}"
+        uncorrected_output_folder_name = f"uncorrected_{exp_name}"
     uncorrected_dir = collect_and_copy_tiffs(
         exp_dir,
         output_folder_name=uncorrected_output_folder_name,
