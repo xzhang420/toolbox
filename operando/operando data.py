@@ -623,6 +623,96 @@ def copy_tiff_with_metadata(src_path, dst_path, mean_tpx_modified_time=None):
 
 
 # =============================================================================
+# Capacity events and nearest image indices
+# =============================================================================
+def find_capacity_turning_points_and_zeros(
+    echem_datetimes,
+    capacity_series,
+    zero_tol=1e-9,
+):
+    """
+    Find timestamps of turning points and zero crossings in Capacity/mA.h.
+
+    Parameters
+    ----------
+    echem_datetimes : list of datetime.datetime
+        Electrochemical time series.
+    capacity_series : array-like
+        Capacity/mA.h values aligned with echem_datetimes.
+    zero_tol : float, optional
+        Absolute tolerance for considering a value as zero.
+
+    Returns
+    -------
+    events : list of dict
+        Each dict has keys: 'index', 'time', 'labels'.
+        labels contains any of: {"zero", "turning"}.
+    """
+    times = np.asarray(echem_datetimes)
+    cap = np.asarray(capacity_series, dtype=float)
+
+    if len(cap) == 0:
+        return []
+
+    labels_by_idx = {}
+
+    # Zero values and sign changes
+    zero_idx = set(np.where(np.abs(cap) <= zero_tol)[0].tolist())
+    if len(cap) > 1:
+        sign = np.sign(cap)
+        sign[sign == 0] = np.nan
+        prod = np.nan_to_num(sign[:-1]) * np.nan_to_num(sign[1:])
+        sign_change_idx = set((np.where(prod < 0)[0] + 1).tolist())
+        zero_idx |= sign_change_idx
+
+    for idx in zero_idx:
+        labels_by_idx.setdefault(idx, set()).add("zero")
+
+    # Turning points (sign change in first derivative)
+    if len(cap) > 2:
+        d = np.diff(cap)
+        sign_d = np.sign(d)
+        sign_d[sign_d == 0] = np.nan
+        prod_d = np.nan_to_num(sign_d[:-1]) * np.nan_to_num(sign_d[1:])
+        turning_idx = set((np.where(prod_d < 0)[0] + 1).tolist())
+        for idx in turning_idx:
+            labels_by_idx.setdefault(idx, set()).add("turning")
+
+    events = []
+    for idx in sorted(labels_by_idx.keys()):
+        events.append({
+            "index": int(idx),
+            "time": times[idx],
+            "labels": sorted(labels_by_idx[idx]),
+        })
+    return events
+
+
+def find_nearest_image_indices(event_times, img_datetimes):
+    """
+    For each event time, find the index of the closest image timestamp.
+
+    Parameters
+    ----------
+    event_times : list of datetime.datetime
+    img_datetimes : list of datetime.datetime
+
+    Returns
+    -------
+    list of int
+        Indices into img_datetimes.
+    """
+    img_times = np.asarray(img_datetimes)
+    if len(img_times) == 0:
+        return []
+    indices = []
+    for t in event_times:
+        deltas = np.abs(img_times - t)
+        indices.append(int(np.argmin(deltas)))
+    return indices
+
+
+# =============================================================================
 # High-level pipeline function
 # =============================================================================
 """
