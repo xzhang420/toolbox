@@ -1,9 +1,15 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
+import pandas as pd
 import tifffile
 from PIL import Image
 from astropy.io import fits
+import matplotlib.pyplot as plt
+from matplotlib.animation import FFMpegWriter
+import matplotlib.patches as patches
+from bisect import bisect_right
+from matplotlib_scalebar.scalebar import ScaleBar
 
 def load_images(
     root_folder,
@@ -140,13 +146,6 @@ def load_images(
     return datetime_series, img_series, paths
 
 
-
-
-import os
-import numpy as np
-import pandas as pd
-from datetime import datetime, timedelta
-
 def load_echem_data(root_folder, conv_thickness=1.0, time_column="time/s"):
     """
     Recursively load all electrochemical txt files in a folder tree,
@@ -234,59 +233,6 @@ def load_echem_data(root_folder, conv_thickness=1.0, time_column="time/s"):
 
 
 
-
-
-
-
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FFMpegWriter
-from bisect import bisect_right
-from datetime import timedelta
-
-
-def block_mean(img, bin_y=2, bin_x=2):
-    h, w = img.shape
-    h2 = (h // bin_y) * bin_y
-    w2 = (w // bin_x) * bin_x
-    cropped = img[:h2, :w2]
-    return cropped.reshape(h2 // bin_y, bin_y, w2 // bin_x, bin_x).mean(axis=(1, 3))
-
-
-def upsample_nearest(img, bin_y=2, bin_x=2, target_shape=None):
-    up = np.repeat(np.repeat(img, bin_y, axis=0), bin_x, axis=1)
-    if target_shape is not None:
-        return up[:target_shape[0], :target_shape[1]]
-    return up
-
-
-def process_reference_images(
-    ref_series,
-    bin_y=2,
-    bin_x=2,
-):
-    """
-    1) Bin each reference image (smoothing)
-    2) Average binned images
-    3) Clamp pixels below the global mean to the mean
-    4) Upsample back to original size for division
-    """
-    if len(ref_series) == 0:
-        raise ValueError("ref_series is empty.")
-
-    # bin each image first
-    binned = [block_mean(img, bin_y=bin_y, bin_x=bin_x) for img in ref_series]
-    ref_avg = np.mean(np.stack(binned, axis=0), axis=0)
-
-    # clamp below global mean
-    global_mean = float(np.mean(ref_avg))
-    ref_avg = np.maximum(ref_avg, global_mean)
-
-    # upsample back to original resolution
-    ref_processed = upsample_nearest(
-        ref_avg, bin_y=bin_y, bin_x=bin_x, target_shape=ref_series[0].shape
-    )
-    return ref_processed
 def make_potential_image_video_uniform_time(
     echem_datetimes,
     potential_series,
@@ -300,32 +246,23 @@ def make_potential_image_video_uniform_time(
     vmin=None,
     vmax=None,
     potential_ylim=None,
+    pixel_size=55,  # Pixel size in micrometers
+    scalebar_length=5000,  # Length of scale bar in micrometers
+    scale_label="5 mm",  # Label for scale bar
+    colorbar_label="Li thickness",  # Label for colorbar
+    cbar_n_ticks=5,
+    # Additional scale bar customization options
+    scalebar_color='white',
+    scale_fontsize=12,
+    scalebar_width_frac=0.015,  # Height of scale bar as fraction of image height
+    scalebar_position='lower right',  # 'lower right', 'lower left', 'upper right', 'upper left'
+    scalebar_margin=0.1,  # Margin from edge as fraction of image dimensions
 ):
     """
     Create a synchronized potential–image video using a uniform global time axis.
-
+    
     Potential: zero-order hold (previous value)
     Image: nearest in time
-
-    Parameters
-    ----------
-    echem_datetimes : list of datetime.datetime
-    potential_series : np.ndarray
-    img_datetimes : list of datetime.datetime
-    img_series : list of 2D np.ndarray
-    output_path : str
-        Output video filename (mp4)
-    fps : int
-        Frames per second
-    dt_seconds : float or None
-        Time step of animation grid.
-        If None, uses median image timestep.
-    dpi : int
-        Video DPI
-    cmap : str
-        Image colormap
-    vmin, vmax : float or None
-        Fixed image color scale
     """
 
     # ------------------------------------------------------------------
@@ -347,6 +284,8 @@ def make_potential_image_video_uniform_time(
 
     echem_t = np.array([(t - t0).total_seconds() for t in echem_datetimes])
     img_t = np.array([(t - t0).total_seconds() for t in img_datetimes])
+    
+    # Define echem_t_h HERE before it's used
     echem_t_h = echem_t / 3600.0
 
     # ------------------------------------------------------------------
@@ -397,16 +336,95 @@ def make_potential_image_video_uniform_time(
     if potential_ylim is not None:
         ax_v.set_ylim(potential_ylim)
 
-    # Image
+    # Get image dimensions for physical extent
+    first_img = img_series[0]
+    ny, nx = first_img.shape
+    
+    # Calculate physical extent in micrometers
+    x_min = 0
+    x_max = nx * pixel_size
+    y_min = 0
+    y_max = ny * pixel_size
+
+        # Image with physical extent
     im = ax_img.imshow(
         img_series[0],
         cmap=cmap,
+        extent=[x_min, x_max, y_min, y_max],
         origin="lower",
         vmin=vmin,
         vmax=vmax,
     )
+    
+    # Remove ticks and tick labels from the image axis
     ax_img.set_xticks([])
     ax_img.set_yticks([])
+    ax_img.set_xticklabels([])
+    ax_img.set_yticklabels([])
+
+    # Add colorbar
+    cbar = fig.colorbar(im, ax=ax_img, fraction=0.046, pad=0.04)
+    cbar.set_label(colorbar_label)
+    
+    # Set ticks - exactly like in plot_images()!
+    if vmin is not None and vmax is not None:
+        ticks = np.linspace(vmin, vmax, cbar_n_ticks)
+        cbar.set_ticks(ticks)
+        
+        # Simple tick labels without units (units are in the colorbar label)
+        labels = []
+        for t in ticks:
+            if np.isclose(t, 0):
+                labels.append("0")
+            else:
+                labels.append(f"{t:g}")
+        cbar.set_ticklabels(labels)
+    
+    # ------------------------------------------------------------------
+    # Create scale bar parameters (but don't add it yet)
+    # ------------------------------------------------------------------
+    
+    # Determine scale bar position based on user preference
+    if scalebar_position == 'lower right':
+        scale_x = x_max - scalebar_length - scalebar_margin * (x_max - x_min)
+        scale_y = y_min + scalebar_margin * (y_max - y_min)
+        text_ha = 'center'
+        text_x_offset = scalebar_length / 2
+    elif scalebar_position == 'lower left':
+        scale_x = x_min + scalebar_margin * (x_max - x_min)
+        scale_y = y_min + scalebar_margin * (y_max - y_min)
+        text_ha = 'center'
+        text_x_offset = scalebar_length / 2
+    elif scalebar_position == 'upper right':
+        scale_x = x_max - scalebar_length - scalebar_margin * (x_max - x_min)
+        scale_y = y_max - scalebar_margin * (y_max - y_min) - scalebar_width_frac * (y_max - y_min)
+        text_ha = 'center'
+        text_x_offset = scalebar_length / 2
+    elif scalebar_position == 'upper left':
+        scale_x = x_min + scalebar_margin * (x_max - x_min)
+        scale_y = y_max - scalebar_margin * (y_max - y_min) - scalebar_width_frac * (y_max - y_min)
+        text_ha = 'center'
+        text_x_offset = scalebar_length / 2
+    else:
+        # Default to lower right
+        scale_x = x_max - scalebar_length - scalebar_margin * (x_max - x_min)
+        scale_y = y_min + scalebar_margin * (y_max - y_min)
+        text_ha = 'center'
+        text_x_offset = scalebar_length / 2
+    
+    # Calculate scale bar height in physical units (micrometers)
+    scalebar_height = scalebar_width_frac * (y_max - y_min)
+    
+    # Create scale bar rectangle (we'll add it in the animation loop)
+    scalebar_rect = patches.Rectangle(
+        (scale_x, scale_y),
+        scalebar_length,
+        scalebar_height,
+        facecolor=scalebar_color,
+        edgecolor='none',
+        alpha=0.9,
+        zorder=10  # High zorder to appear on top of image
+    )
 
     plt.tight_layout()
 
@@ -426,6 +444,30 @@ def make_potential_image_video_uniform_time(
             j = nearest_image_index(t)
             im.set_data(img_series[j])
 
+            # Remove previous scale bar rectangles and text
+            for artist in ax_img.patches[:]:
+                if isinstance(artist, patches.Rectangle) and hasattr(artist, 'get_width') and artist.get_width() == scalebar_length:
+                    artist.remove()
+            for artist in ax_img.texts[:]:
+                if scale_label in artist.get_text():
+                    artist.remove()
+            
+            # Add fresh scale bar rectangle
+            ax_img.add_patch(scalebar_rect)
+            
+            # Add fresh scale bar label
+            ax_img.text(
+                scale_x + text_x_offset,
+                scale_y + scalebar_height * 1.5,  # Position above the scale bar
+                scale_label,
+                color=scalebar_color,
+                ha=text_ha,
+                va='bottom',
+                fontsize=scale_fontsize,
+                fontweight='bold',
+                zorder=10  # High zorder to appear on top of image
+            )
+
             ax_img.set_title(
                 f"Image @ {img_datetimes[j].strftime('%Y-%m-%d %H:%M:%S')}"
             )
@@ -435,13 +477,7 @@ def make_potential_image_video_uniform_time(
     plt.close(fig)
 
 
-
-
-
-import numpy as np
-from datetime import timedelta
-
-
+    
 def merge_images_by_time(
     img_datetimes,
     img_series,
@@ -503,18 +539,6 @@ def merge_images_by_time(
     return merged_datetimes, merged_images
 
 
-
-
-
-
-
-
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FFMpegWriter
-from bisect import bisect_right
-
-
 def make_echem_neutron_video(
     echem_folder,
     image_folder,
@@ -530,6 +554,10 @@ def make_echem_neutron_video(
     vmax=None,
     dpi=150,
     image_kwargs=None,
+    pixel_size=55,  # Pixel size in micrometers
+    scalebar_length=5000,  # Length of scale bar in micrometers
+    scale_label="5 mm",  # Full text to display on scale bar
+    colorbar_label="Li thickness",  # Label for colorbar
 ):
     """
     Load electrochemical + neutron image data and create a synchronized video.
@@ -560,6 +588,14 @@ def make_echem_neutron_video(
         Video DPI
     image_kwargs : dict or None
         Passed to load_images (ROI cropping, etc.)
+    pixel_size : float
+        Pixel size in micrometers
+    scalebar_length : float
+        Length of scale bar in micrometers
+    scale_label : str
+        Full label to display on scale bar (e.g., "5 mm")
+    colorbar_label : str
+        Label for colorbar
     """
 
     image_kwargs = image_kwargs or {}
@@ -637,8 +673,58 @@ def make_echem_neutron_video(
         vmin=vmin,
         vmax=vmax,
     )
+    
+    # Add colorbar
+    cbar = fig.colorbar(im, ax=ax_i, fraction=0.046, pad=0.04)
+    cbar.set_label(colorbar_label)
+    
+    # Remove ticks
     ax_i.set_xticks([])
     ax_i.set_yticks([])
+    
+    # Add scale bar - correct ScaleBar usage
+    # Determine the unit from the scale_label
+    if "mm" in scale_label:
+        units = "mm"
+    elif "cm" in scale_label:
+        units = "cm"
+    elif "m" in scale_label:
+        units = "m"
+    elif "µm" in scale_label or "um" in scale_label:
+        units = "µm"
+    else:
+        units = "m"  # default
+    
+    # Extract the numeric value from the scale_label or use the provided length
+    import re
+    numeric_match = re.search(r'(\d+(?:\.\d+)?)', scale_label)
+    if numeric_match:
+        fixed_value = float(numeric_match.group(1))
+        # Convert to meters if needed
+        if units == "mm":
+            fixed_value = fixed_value * 1e-3
+        elif units == "cm":
+            fixed_value = fixed_value * 1e-2
+        elif units == "µm":
+            fixed_value = fixed_value * 1e-6
+    else:
+        fixed_value = scalebar_length * 1e-6  # Convert from micrometers to meters
+    
+    scalebar = ScaleBar(
+        pixel_size * 1e-6,  # dx: pixel size in meters
+        units,  # units for the scale bar
+        location='lower right',
+        frameon=True,
+        color='white',
+        box_color='black',
+        box_alpha=0.6,
+        scale_loc='top',
+        border_pad=0.5,
+        fixed_value=fixed_value,  # Fixed length in meters
+        fixed_units='m',  # Units for the fixed value (always meters internally)
+        label=scale_label  # Custom label text
+    )
+    ax_i.add_artist(scalebar)
 
     plt.tight_layout()
 
@@ -662,26 +748,6 @@ def make_echem_neutron_video(
 
     plt.close(fig)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import numpy as np
 
 def circular_average_thickness_series(img_series, x0=None, y0=None, r0=None):
     """
@@ -729,11 +795,6 @@ def circular_average_thickness_series(img_series, x0=None, y0=None, r0=None):
 
     return np.asarray(avg_thickness_series)
 
-
-
-
-import numpy as np
-import matplotlib.pyplot as plt
 
 def plot_potential_and_thickness(
     echem_datetime_series,

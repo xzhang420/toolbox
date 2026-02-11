@@ -132,6 +132,86 @@ def is_tiff_file(path):
 
 
 # =============================================================================
+# Reference image processing (bin -> average -> clamp -> upsample)
+# =============================================================================
+def block_mean(img, bin_y=2, bin_x=2):
+    h, w = img.shape
+    h2 = (h // bin_y) * bin_y
+    w2 = (w // bin_x) * bin_x
+    cropped = img[:h2, :w2]
+    return cropped.reshape(h2 // bin_y, bin_y, w2 // bin_x, bin_x).mean(axis=(1, 3))
+
+
+def upsample_nearest(img, bin_y=2, bin_x=2, target_shape=None):
+    up = np.repeat(np.repeat(img, bin_y, axis=0), bin_x, axis=1)
+    if target_shape is not None:
+        return up[:target_shape[0], :target_shape[1]]
+    return up
+
+
+def process_reference_images(ref_series, bin_y=2, bin_x=2, compute_dtype=np.float32):
+    """
+    1) Average reference images
+    2) Compute global mean of the averaged image
+    3) Clamp pixels below the global mean
+    4) Bin (smooth) the clamped image
+    5) Upsample back to original size for division
+    """
+    if len(ref_series) == 0:
+        raise ValueError("ref_series is empty.")
+
+    ref_stack = np.stack(
+        [np.asarray(img, dtype=compute_dtype) for img in ref_series],
+        axis=0,
+    )
+    ref_avg = np.mean(ref_stack, axis=0, dtype=compute_dtype)
+
+    global_mean = float(np.mean(ref_avg))
+    ref_clamped = np.maximum(ref_avg, global_mean)
+
+    ref_binned = block_mean(ref_clamped, bin_y=bin_y, bin_x=bin_x)
+
+    ref_processed = upsample_nearest(
+        ref_binned,
+        bin_y=bin_y,
+        bin_x=bin_x,
+        target_shape=ref_series[0].shape,
+    )
+    return ref_processed
+
+
+def load_reference_image_series(
+    reference_dir,
+    final_subfolder="final",
+    dtype=np.float32,
+):
+    """
+    Load all reference TIFF images from run subfolders.
+    """
+    ref_series = []
+    for run_dir in sorted(os.listdir(reference_dir)):
+        run_path = os.path.join(reference_dir, run_dir)
+        if not os.path.isdir(run_path):
+            continue
+        final_dir = os.path.join(run_path, final_subfolder)
+        if not os.path.isdir(final_dir):
+            continue
+
+        for fname in sorted(os.listdir(final_dir)):
+            path = os.path.join(final_dir, fname)
+            if not os.path.isfile(path) or not is_tiff_file(path):
+                continue
+            try:
+                img = tifffile.imread(path)
+                if img.ndim != 2:
+                    continue
+                ref_series.append(np.asarray(img, dtype=dtype))
+            except Exception:
+                continue
+    return ref_series
+
+
+# =============================================================================
 # Run-level beam metrics
 # =============================================================================
 """
@@ -367,6 +447,12 @@ acquisition_time : datetime.datetime, optional
     Acquisition time to be written into TIFF metadata (nearest second).
 mean_tpx_modified_time : datetime.datetime, optional
     Mean modified time of corresponding TPX files (nearest second).
+reference_image : np.ndarray or None, optional
+    Processed averaged reference image used for pixel-wise normalization.
+compute_dtype : data-type, optional
+    Floating-point dtype used during correction math.
+output_dtype : data-type, optional
+    Floating-point dtype used when writing corrected TIFFs.
 
 Notes
 -----
@@ -381,11 +467,27 @@ def correct_and_save_tiff(
     correction_factor,
     acquisition_time,
     mean_tpx_modified_time=None,
+    reference_image=None,
+    compute_dtype=np.float32,
+    output_dtype=np.float32,
 ):
     with tifffile.TiffFile(src_path) as tif:
         img = tif.asarray()
 
-    corrected = img / correction_factor
+    corrected = np.asarray(img, dtype=compute_dtype) / float(correction_factor)
+    if reference_image is not None:
+        if corrected.shape != reference_image.shape:
+            raise ValueError(
+                f"Reference image shape {reference_image.shape} does not match "
+                f"image shape {corrected.shape} for {src_path}."
+            )
+        safe_ref = np.asarray(reference_image, dtype=compute_dtype)
+        corrected = np.divide(
+            corrected,
+            safe_ref,
+            out=np.zeros_like(corrected, dtype=compute_dtype),
+            where=safe_ref != 0,
+        )
 
     # Add custom metadata
     # Use private TIFF tags to avoid KeyError with custom tag names
@@ -404,7 +506,7 @@ def correct_and_save_tiff(
 
     tifffile.imwrite(
         dst_path,
-        corrected.astype(img.dtype),
+        corrected.astype(output_dtype),
         extratags=extratags
     )
 
@@ -434,6 +536,12 @@ reference_dir : str
     Root directory containing reference runs (same structure as operando data).
 reference_beamhistory_path : str
     Path to the .dat file containing beam history for the reference data.
+processed_reference_image : np.ndarray or None, optional
+    Processed averaged reference image for pixel-wise division.
+compute_dtype : data-type, optional
+    Floating-point dtype used for all correction math.
+corrected_output_dtype : data-type, optional
+    Floating-point dtype used when writing corrected TIFFs.
 
 Notes
 -----
@@ -453,6 +561,9 @@ def intensity_correct_experiment(
     reference_beam_integral_per_minute=None,
     reference_dir=None,
     reference_beamhistory_path=None,
+    processed_reference_image=None,
+    compute_dtype=np.float32,
+    corrected_output_dtype=np.float32,
 ):
     beamhistory = load_beamhistory(beamhistory_path)
 
@@ -514,7 +625,14 @@ def intensity_correct_experiment(
                 continue
 
             correct_and_save_tiff(
-                src, dst, correction_factor, mean_tpx_time, mean_tpx_time
+                src,
+                dst,
+                correction_factor,
+                mean_tpx_time,
+                mean_tpx_time,
+                reference_image=processed_reference_image,
+                compute_dtype=compute_dtype,
+                output_dtype=corrected_output_dtype,
             )
         if skipped_in_run:
             warnings.warn(
@@ -745,6 +863,16 @@ reference_beamhistory_path : str
 uncorrected_output_folder_name : str, optional
     Output folder name for uncorrected TIFFs. If None, creates an
     "uncorrected_<experiment_folder_name>" folder alongside exp_dir.
+reference_bin_y : int, optional
+    Vertical binning factor used to process reference images.
+reference_bin_x : int, optional
+    Horizontal binning factor used to process reference images.
+reference_final_subfolder : str, optional
+    Subfolder name inside each reference run containing TIFF images.
+compute_dtype : data-type, optional
+    Floating-point dtype used in intermediate calculations.
+corrected_output_dtype : data-type, optional
+    Floating-point dtype used when writing corrected TIFFs.
 
 Returns
 -------
@@ -759,6 +887,11 @@ def run_operando_pipeline(
     reference_dir=None,
     reference_beamhistory_path=None,
     uncorrected_output_folder_name=None,
+    reference_bin_y=2,
+    reference_bin_x=2,
+    reference_final_subfolder="final",
+    compute_dtype=np.float32,
+    corrected_output_dtype=np.float32,
 ):
     if reference_dir is None or reference_beamhistory_path is None:
         raise ValueError(
@@ -778,6 +911,23 @@ def run_operando_pipeline(
         exposure_seconds,
     )
 
+    ref_series = load_reference_image_series(
+        reference_dir,
+        final_subfolder=reference_final_subfolder,
+        dtype=compute_dtype,
+    )
+    if len(ref_series) == 0:
+        raise ValueError(
+            "No reference TIFF images found. "
+            "Check reference_dir and reference_final_subfolder."
+        )
+    processed_reference_image = process_reference_images(
+        ref_series,
+        bin_y=reference_bin_y,
+        bin_x=reference_bin_x,
+        compute_dtype=compute_dtype,
+    )
+
     if uncorrected_output_folder_name is None:
         uncorrected_output_folder_name = f"uncorrected_{exp_name}"
     uncorrected_dir = collect_and_copy_tiffs(
@@ -794,6 +944,9 @@ def run_operando_pipeline(
         reference_beam_integral_per_minute=reference_beam_integral_per_minute,
         reference_dir=reference_dir,
         reference_beamhistory_path=reference_beamhistory_path,
+        processed_reference_image=processed_reference_image,
+        compute_dtype=compute_dtype,
+        corrected_output_dtype=corrected_output_dtype,
     )
 
     return {
@@ -801,3 +954,4 @@ def run_operando_pipeline(
         "uncorrected_dir": uncorrected_dir,
         "reference_beam_integral_per_minute": reference_beam_integral_per_minute,
     }
+

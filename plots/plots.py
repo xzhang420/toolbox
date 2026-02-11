@@ -1,241 +1,8 @@
-# =============================================================================
-# plot_images
-# =============================================================================
-# Plot a multi-panel scientific image figure with individual or shared color
-# bars, optional row and column legends, and a single physical scale bar.
-#
-# Parameters
-# ----------
-# img_series : array-like
-#     List or array of 2D images to plot.
-#
-# img_indices : list of int
-#     Indices of images from `img_series` to display.
-#
-# pixel_size : float
-#     Physical size of one pixel. Must be in the same units used for the
-#     scale bar length.
-#
-# r0 : int or None, optional
-#     Half-width of the square region of interest (ROI) in pixels.
-#     If None, the full image is shown.
-#
-# x0, y0 : int or None, optional
-#     Pixel indices of the ROI center (column, row).
-#     If None, the image center is used.
-#
-# conv_thickness : float, optional
-#     Image values are divided by this factor before plotting.
-#
-# cmap : str, optional
-#     Matplotlib colormap used for all images.
-#
-# cbar_ranges : list of tuple or None, optional
-#     List of (vmin, vmax) tuples specifying color bar ranges for each image.
-#     If None, ranges are determined automatically from the ROI of each image.
-#
-# cbar_mode : {"individual top", "individual bottom", "shared left", "shared right"}, optional
-#     Determines whether each image has its own color bar or a single shared
-#     color bar is shown on the left or right side.
-#
-# cbar_length_frac : float, optional
-#     Fraction of the image width occupied by individual color bars.
-#
-# cbar_width_frac : float, optional
-#     Thickness of the color bar in figure-relative units.
-#
-# cbar_n_ticks : int, optional
-#     Number of ticks shown on each color bar.
-#
-# cbar_unit : str or list of str or None, optional
-#     Unit label(s) appended to non-zero color bar tick labels.
-#     If a list is provided, it must match the number of images.
-#
-# cbar_fontsize : int, optional
-#     Font size of color bar tick labels.
-#
-# cbar_fontname : str, optional
-#     Font name used for color bar tick labels.
-#
-# cbar_fontweight : str, optional
-#     Font weight used for color bar tick labels.
-#
-# cbar_show_ticklines : bool, optional
-#     If True, draw small tick lines on the color bar corresponding to each
-#     tick value. If False, only tick labels are shown.
-#
-# scalebar_mode : {"inside", "outside left", "outside right"} or None, optional
-#     Placement mode of the scale bar. If "inside", the scale bar is drawn
-#     inside the first image. If "outside", it is drawn next to the image grid.
-#
-# scalebar_length : float, optional
-#     Physical length of the scale bar. Must be in the same units as
-#     `pixel_size`.
-#
-# scalebar_width_frac : float, optional
-#     Thickness of the scale bar in figure-relative units.
-#
-# scalebar_color : str or None, optional
-#     Color of the scale bar and its label. If None, defaults to black for
-#     outside scale bars and white for inside scale bars.
-#
-# scale_label : str or None, optional
-#     Text label displayed above the scale bar. If None, a label is generated
-#     automatically from `scalebar_length`.
-#
-# scale_fontsize : int, optional
-#     Font size of the scale bar label.
-#
-# scale_fontname : str, optional
-#     Font name used for the scale bar label.
-#
-# scale_fontweight : str, optional
-#     Font weight used for the scale bar label.
-#
-# scalebar_pad : float, optional
-#     Distance between the outside scale bar and the image grid, in
-#     figure-relative units.
-#
-# show_labels : bool, optional
-#     If True, subplot labels ("a", "b", "c", ...) are displayed.
-#
-# label_fontsize : int, optional
-#     Font size of subplot labels.
-#
-# label_fontname : str, optional
-#     Font name used for subplot labels.
-#
-# label_fontweight : str, optional
-#     Font weight used for subplot labels.
-#
-# row_labels : list of str or None, optional
-#     Text labels for each row of images, displayed to the left of the grid.
-#     Length must match the number of rows.
-#
-# col_labels : list of str or None, optional
-#     Text labels for each column of images, displayed above the grid.
-#     Length must match the number of columns.
-#
-# row_label_fontsize : int, optional
-#     Font size of row labels.
-#
-# col_label_fontsize : int, optional
-#     Font size of column labels.
-#
-# row_label_fontname : str, optional
-#     Font name used for row labels.
-#
-# col_label_fontname : str, optional
-#     Font name used for column labels.
-#
-# row_label_fontweight : str, optional
-#     Font weight used for row labels.
-#
-# col_label_fontweight : str, optional
-#     Font weight used for column labels.
-#
-# row_label_pad : float, optional
-#     Horizontal distance between the left edge of the row label text and
-#     the image grid, in figure-relative units. This allows consistent image
-#     alignment when using row labels of different lengths.
-#
-# col_label_pad : float, optional
-#     Vertical distance between the top of the image grid and the column
-#     labels, in figure-relative units.
-#
-# figsize : tuple of float, optional
-#     Size of the figure in inches.
-#
-# nrows, ncols : int or None, optional
-#     Number of rows and columns in the image grid. If None, a nearly square
-#     layout is chosen automatically.
-#
-# spacing : tuple of float, optional
-#     Horizontal and vertical spacing between subplots, in figure-relative
-#     units.
-#
-# Returns
-# -------
-# fig : matplotlib.figure.Figure
-#     The created figure.
-#
-# axes : ndarray of matplotlib.axes.Axes
-#     Axes corresponding to the plotted images.
-#
-# Notes
-# -----
-# - Shared color bar modes enforce a single normalization across all images.
-# - ROI selection is performed in pixel indices, not physical units.
-# - Color bar ticks are placed using locators (no FixedFormatter misuse).
-# - Scale bar length is physically accurate and consistent across figures.
-# - Row labels are positioned such that their left edge is aligned at a fixed
-#   distance from the image grid, enabling vertical alignment across figures.
-#
-# =============================================================================
-
-
-    
-'''
-
-Example Use:
-
-cbar_ranges = [
-    (0, 20),
-    (0, 2),
-    (0, 100),
-    (0, 40)
-]
-
-fig, axes = plot_images(
-    NRimg_series,
-    img_indices=[0, 1, 2, 3],
-    pixel_size=34.4,
-    show_labels=False,
-    
-    col_labels=["a - 10 μm plated", "b - 1 μm plated", "c - 100 nm plated", "d - not plated"],
-    col_label_fontsize=20,
-    col_label_pad= 0.2,
-    row_labels=["NR"],
-    row_label_fontsize=20,
-    row_label_pad=0.06,
-
-    # Color bar
-    cmap="gray",
-    cbar_ranges=cbar_ranges,
-    cbar_length_frac=0.8,
-    cbar_mode="individual top",
-    cbar_fontsize=16,
-    cbar_unit=["μm","μm","nm","nm"],
- #   cbar_width_frac=0.01,
-    cbar_show_ticklines=True,
-
-
-    # Scale bar
-    scale_fontsize=16,
-    scalebar_mode="outside left",
-    scalebar_length=5000,
-    scale_label="5 mm",
-    scalebar_width_frac=0.01,
-    
-    # Figure layout   
-    spacing=(0.05, 0),
-    figsize=(16, 4),
-    ncols=4,
-    nrows=1
-)
-
-plt.show()
-
-'''
-
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 import math
 
-# =============================================================================
-# plot_images
-# =============================================================================
 def plot_images(
     img_series,
     img_indices,
@@ -254,25 +21,27 @@ def plot_images(
     cbar_ranges=None,
     cbar_mode="individual bottom",   # "individual top", "individual bottom",
                                      # "shared left", "shared right"
-    cbar_length_frac=0.8,
-    cbar_width_frac=0.03,
+    cbar_individual_length=0.8,      # Renamed: width of individual color bars (fraction of image width)
+    cbar_shared_length=0.8,          # NEW: length/height of shared color bars (fraction of grid height)
+    cbar_width_frac=0.015,
     cbar_n_ticks=3,
     cbar_unit=None,
     cbar_fontsize=8,
     cbar_fontname="Arial",
     cbar_fontweight="normal",
     cbar_show_ticklines=True,
+    cbar_pad=0.01,                   # Distance between color bar and subplots for shared left/right
 
     # Scale bar
     scalebar_mode="outside left",     # "inside", "outside left", "outside right"
     scalebar_length=5,
-    scalebar_width_frac=0.02,
+    scalebar_width_frac=0.015,
     scalebar_color=None,
     scale_label=None,
     scale_fontsize=9,
     scale_fontname="Arial",
     scale_fontweight="bold",
-    scalebar_pad=0.02,                # <<< NEW: distance from images (figure fraction)
+    scalebar_pad=0.02,               # Distance from images (figure fraction)
 
     # Labels
     show_labels=True,
@@ -411,7 +180,7 @@ def plot_images(
                 patches.Rectangle(
                     (scale_x, scale_y),
                     scalebar_length,
-                    0.015 * (y_max - y_min),
+                    scalebar_width_frac * (y_max - y_min),
                     facecolor=bar_color,
                     edgecolor="none",
                 )
@@ -472,25 +241,56 @@ def plot_images(
 
             h = cbar_width_frac * pos.height
             y0 = pos.y1 if top else pos.y0 - h
-            x0 = pos.x0 + (1 - cbar_length_frac) / 2 * pos.width
+            x0 = pos.x0 + (1 - cbar_individual_length) / 2 * pos.width
 
-            cax = fig.add_axes([x0, y0, cbar_length_frac * pos.width, h])
+            cax = fig.add_axes([x0, y0, cbar_individual_length * pos.width, h])
             cbar = plt.colorbar(im, cax=cax, orientation="horizontal")
             apply_cbar_ticks(cbar, *im.get_clim(), cbar_units[j])
             cbar.ax.xaxis.set_ticks_position("top" if top else "bottom")
 
-    else:
-        right = "right" in cbar_mode
-        ref = axes[n_images - 1 if right else 0].get_position()
-
+    else:  # Shared color bars
+        # Get positions of all image axes to find the vertical center of the grid
+        positions = [axes[i].get_position() for i in range(min(n_images, nrows * ncols))]
+        
+        # Find the vertical center of the entire grid
+        y0_min = min(pos.y0 for pos in positions)
+        y1_max = max(pos.y1 for pos in positions)
+        grid_center_y = (y0_min + y1_max) / 2
+        grid_height = y1_max - y0_min
+        
         w = cbar_width_frac
-        x0 = ref.x1 + 0.01 if right else ref.x0 - w - 0.01
-        y0 = ref.y0
-        h = ref.height
+        # Set color bar height based on cbar_shared_length (fraction of grid height)
+        h = grid_height * cbar_shared_length
+        
+        if "left" in cbar_mode:
+            # Position color bar to the left of the grid
+            x0 = min(pos.x0 for pos in positions) - w - cbar_pad
+            # Set ticks on the left side
+            tick_position = "left"
+        else:  # "right" in cbar_mode
+            # Position color bar to the right of the grid
+            x0 = max(pos.x1 for pos in positions) + cbar_pad
+            # Set ticks on the right side
+            tick_position = "right"
+            
+        # Center the color bar vertically
+        y0 = grid_center_y - h/2
 
         cax = fig.add_axes([x0, y0, w, h])
         cbar = plt.colorbar(images[0], cax=cax, orientation="vertical")
+        
+        # Apply ticks and formatting
         apply_cbar_ticks(cbar, vmin_shared, vmax_shared, cbar_units[0])
+        
+        # Set tick position based on color bar location
+        if cbar_mode == "shared left":
+            # Move ticks to the left side
+            cbar.ax.yaxis.set_ticks_position("left")
+            cbar.ax.yaxis.set_label_position("left")
+        elif cbar_mode == "shared right":
+            # Keep ticks on the right side (default)
+            cbar.ax.yaxis.set_ticks_position("right")
+            cbar.ax.yaxis.set_label_position("right")
 
     # -------------------------
     # Outside scale bar
