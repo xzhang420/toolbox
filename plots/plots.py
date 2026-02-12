@@ -45,6 +45,7 @@ def plot_images(
 
     # Labels
     show_labels=True,
+    label_start=0,
     label_fontsize=14,
     label_fontname="Arial",
     label_fontweight="bold",
@@ -156,7 +157,7 @@ def plot_images(
             ax.text(
                 0.05,
                 0.95,
-                chr(97 + j),
+                chr(97 + label_start + j),
                 transform=ax.transAxes,
                 fontsize=label_fontsize,
                 fontname=label_fontname,

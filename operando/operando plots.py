@@ -438,7 +438,7 @@ def make_potential_image_video_uniform_time(
 
             # Potential (ZOH)
             v = potential_at(t)
-            marker.set_data(t / 3600.0, v)
+            marker.set_data([t / 3600.0], [v])
 
             # Image (nearest)
             j = nearest_image_index(t)
@@ -795,7 +795,6 @@ def circular_average_thickness_series(img_series, x0=None, y0=None, r0=None):
 
     return np.asarray(avg_thickness_series)
 
-
 def plot_potential_and_thickness(
     echem_datetime_series,
     potential_series,
@@ -804,6 +803,10 @@ def plot_potential_and_thickness(
     avg_thickness_series=None,
     plot_thickness=False,
     potential_ylim=None,
+    event_times=None,
+    label_start=0,
+    event_marker_size=3,
+    event_label_fontsize=10,
 ):
     """
     Plot potential, electrochemical thickness, and image-derived average thickness
@@ -811,6 +814,7 @@ def plot_potential_and_thickness(
 
     Time ranges where only electrochemical data exists (before or after image data)
     are truncated.
+    Optional event labels can be added on the potential trace via event_times.
     """
 
     # ---- Convert to numpy arrays ----
@@ -848,13 +852,38 @@ def plot_potential_and_thickness(
     # ---- Plot ----
     fig, ax1 = plt.subplots(figsize=(8, 4.5))
 
-    # Potential (left axis)
+    # Potential (left axis)  <-- this must NOT use idx
     ax1.plot(t_echem, potential_series, label="Potential (Ewe/V)")
     ax1.set_xlabel("Time elapsed (h)")
     ax1.set_ylabel("Potential (V)")
     ax1.tick_params(axis="y")
     if potential_ylim is not None:
         ax1.set_ylim(potential_ylim)
+
+    # Optional event markers/labels on the potential trace.
+    if event_times is not None and len(event_times) > 0:
+        for j, raw_time in enumerate(event_times):
+            event_dt = raw_time
+            if isinstance(raw_time, str):
+                event_dt = pd.to_datetime(raw_time).to_pydatetime()
+
+            if event_dt < echem_datetime_series.min() or event_dt > echem_datetime_series.max():
+                continue
+
+            dt_seconds = np.array([abs((t - event_dt).total_seconds()) for t in echem_datetime_series])
+            idx = int(np.argmin(dt_seconds))
+
+            label = chr(97 + int(label_start) + j)
+            ax1.plot(t_echem[idx], potential_series[idx], "ko", ms=event_marker_size)
+            ax1.annotate(
+                label,
+                (t_echem[idx], potential_series[idx]),
+                textcoords="offset points",
+                xytext=(4, 4),
+                fontsize=event_label_fontsize,
+                fontweight="bold",
+            )
+
 
     # Thickness (right axis)
     if plot_thickness:
@@ -872,3 +901,4 @@ def plot_potential_and_thickness(
 
     plt.tight_layout()
     plt.show()
+
