@@ -11,6 +11,8 @@ import matplotlib.patches as patches
 from bisect import bisect_right
 from matplotlib_scalebar.scalebar import ScaleBar
 
+
+
 def load_images(
     root_folder,
     datetime_formats=("%Y:%m:%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"),
@@ -249,7 +251,7 @@ def make_potential_image_video_uniform_time(
     pixel_size=55,  # Pixel size in micrometers
     scalebar_length=5000,  # Length of scale bar in micrometers
     scale_label="5 mm",  # Label for scale bar
-    colorbar_label="Li thickness",  # Label for colorbar
+    cbar_label="Li thickness",  # Label for colorbar
     cbar_n_ticks=5,
     # Additional scale bar customization options
     scalebar_color='white',
@@ -364,7 +366,7 @@ def make_potential_image_video_uniform_time(
 
     # Add colorbar
     cbar = fig.colorbar(im, ax=ax_img, fraction=0.046, pad=0.04)
-    cbar.set_label(colorbar_label)
+    cbar.set_label(cbar_label)
     
     # Set ticks - exactly like in plot_images()!
     if vmin is not None and vmax is not None:
@@ -539,220 +541,12 @@ def merge_images_by_time(
     return merged_datetimes, merged_images
 
 
-def make_echem_neutron_video(
-    echem_folder,
-    image_folder,
-    output_path,
-    *,
-    conv_thickness=1.0,
-    merge_minutes=1,
-    merge_method="mean",
-    fps=10,
-    dt_seconds=None,
-    cmap="inferno",
-    vmin=None,
-    vmax=None,
-    dpi=150,
-    image_kwargs=None,
-    pixel_size=55,  # Pixel size in micrometers
-    scalebar_length=5000,  # Length of scale bar in micrometers
-    scale_label="5 mm",  # Full text to display on scale bar
-    colorbar_label="Li thickness",  # Label for colorbar
-):
-    """
-    Load electrochemical + neutron image data and create a synchronized video.
-
-    Parameters
-    ----------
-    echem_folder : str
-        Folder containing electrochemical txt files
-    image_folder : str
-        Folder containing neutron images
-    output_path : str
-        Output video filename (.mp4)
-    conv_thickness : float
-        Capacity → thickness conversion (passed to loader)
-    merge_minutes : float
-        Merge images into longer acquisition windows (minutes)
-    merge_method : str
-        'mean' or 'sum'
-    fps : int
-        Video frames per second
-    dt_seconds : float or None
-        Uniform animation timestep (seconds)
-    cmap : str
-        Image colormap
-    vmin, vmax : float or None
-        Fixed image color scale
-    dpi : int
-        Video DPI
-    image_kwargs : dict or None
-        Passed to load_images (ROI cropping, etc.)
-    pixel_size : float
-        Pixel size in micrometers
-    scalebar_length : float
-        Length of scale bar in micrometers
-    scale_label : str
-        Full label to display on scale bar (e.g., "5 mm")
-    colorbar_label : str
-        Label for colorbar
-    """
-
-    image_kwargs = image_kwargs or {}
-
-    # ------------------------------------------------------------
-    # Load data
-    # ------------------------------------------------------------
-    img_dt, img_series, _ = load_images(image_folder, **image_kwargs)
-    echem_dt, potential, _ = load_echem_data(
-        echem_folder,
-        conv_thickness=conv_thickness,
-    )
-
-    # ------------------------------------------------------------
-    # Merge images in time
-    # ------------------------------------------------------------
-    img_dt, img_series = merge_images_by_time(
-        img_dt,
-        img_series,
-        merge_minutes=merge_minutes,
-        method=merge_method,
-    )
-
-    # ------------------------------------------------------------
-    # Convert times to seconds
-    # ------------------------------------------------------------
-    t0 = min(min(echem_dt), min(img_dt))
-
-    echem_t = np.array([(t - t0).total_seconds() for t in echem_dt])
-    img_t = np.array([(t - t0).total_seconds() for t in img_dt])
-
-    if dt_seconds is None:
-        dt_seconds = np.median(np.diff(img_t))
-
-    t_anim = np.arange(
-        min(echem_t.min(), img_t.min()),
-        max(echem_t.max(), img_t.max()),
-        dt_seconds,
-    )
-
-    # ------------------------------------------------------------
-    # Lookup helpers
-    # ------------------------------------------------------------
-    def potential_at(t):
-        i = bisect_right(echem_t, t) - 1
-        return potential[i] if i >= 0 else potential[0]
-
-    def nearest_image_index(t):
-        i = bisect_right(img_t, t)
-        if i == 0:
-            return 0
-        if i == len(img_t):
-            return len(img_t) - 1
-        return i - 1 if abs(t - img_t[i - 1]) <= abs(img_t[i] - t) else i
-
-    # ------------------------------------------------------------
-    # Figure
-    # ------------------------------------------------------------
-    fig, (ax_v, ax_i) = plt.subplots(
-        1, 2, figsize=(10, 4),
-        gridspec_kw={"width_ratios": [1.2, 1]},
-    )
-
-    echem_t_h = echem_t / 3600.0
-    ax_v.plot(echem_t_h, potential, lw=1.5)
-    marker, = ax_v.plot([], [], "ro", ms=6)
-    ax_v.set_xlabel("Time (h)")
-    ax_v.set_ylabel("Potential (V)")
-    ax_v.set_title("Potential evolution")
-
-    im = ax_i.imshow(
-        img_series[0],
-        cmap=cmap,
-        origin="lower",
-        vmin=vmin,
-        vmax=vmax,
-    )
-    
-    # Add colorbar
-    cbar = fig.colorbar(im, ax=ax_i, fraction=0.046, pad=0.04)
-    cbar.set_label(colorbar_label)
-    
-    # Remove ticks
-    ax_i.set_xticks([])
-    ax_i.set_yticks([])
-    
-    # Add scale bar - correct ScaleBar usage
-    # Determine the unit from the scale_label
-    if "mm" in scale_label:
-        units = "mm"
-    elif "cm" in scale_label:
-        units = "cm"
-    elif "m" in scale_label:
-        units = "m"
-    elif "µm" in scale_label or "um" in scale_label:
-        units = "µm"
-    else:
-        units = "m"  # default
-    
-    # Extract the numeric value from the scale_label or use the provided length
-    import re
-    numeric_match = re.search(r'(\d+(?:\.\d+)?)', scale_label)
-    if numeric_match:
-        fixed_value = float(numeric_match.group(1))
-        # Convert to meters if needed
-        if units == "mm":
-            fixed_value = fixed_value * 1e-3
-        elif units == "cm":
-            fixed_value = fixed_value * 1e-2
-        elif units == "µm":
-            fixed_value = fixed_value * 1e-6
-    else:
-        fixed_value = scalebar_length * 1e-6  # Convert from micrometers to meters
-    
-    scalebar = ScaleBar(
-        pixel_size * 1e-6,  # dx: pixel size in meters
-        units,  # units for the scale bar
-        location='lower right',
-        frameon=True,
-        color='white',
-        box_color='black',
-        box_alpha=0.6,
-        scale_loc='top',
-        border_pad=0.5,
-        fixed_value=fixed_value,  # Fixed length in meters
-        fixed_units='m',  # Units for the fixed value (always meters internally)
-        label=scale_label  # Custom label text
-    )
-    ax_i.add_artist(scalebar)
-
-    plt.tight_layout()
-
-    # ------------------------------------------------------------
-    # Animation
-    # ------------------------------------------------------------
-    writer = FFMpegWriter(fps=fps)
-
-    with writer.saving(fig, output_path, dpi=dpi):
-        for t in t_anim:
-
-            marker.set_data(t / 3600.0, potential_at(t))
-
-            j = nearest_image_index(t)
-            im.set_data(img_series[j])
-            ax_i.set_title(
-                f"Image @ {img_dt[j].strftime('%Y-%m-%d %H:%M:%S')}"
-            )
-
-            writer.grab_frame()
-
-    plt.close(fig)
 
 
 def circular_average_thickness_series(img_series, x0=None, y0=None, r0=None):
     """
     Compute the average pixel value within a circular region
-    for each image in an image series.
+    for each image in an image series. Silently rejects infinite and NaN values.
 
     Parameters
     ----------
@@ -769,6 +563,7 @@ def circular_average_thickness_series(img_series, x0=None, y0=None, r0=None):
     -------
     avg_thickness_series : np.ndarray
         Average value inside the circular region for each image
+        (returns NaN for images with no valid pixels in ROI)
     """
 
     avg_thickness_series = []
@@ -789,11 +584,59 @@ def circular_average_thickness_series(img_series, x0=None, y0=None, r0=None):
         # ---- Create circular mask ----
         y, x = np.ogrid[:ny, :nx]
         mask = (x - cx)**2 + (y - cy)**2 <= radius**2
-
-        # ---- Compute average ----
-        avg_thickness_series.append(np.nanmean(img[mask]))
+        
+        # ---- Extract values in ROI and handle invalid values ----
+        roi_values = img[mask].astype(float)
+        
+        # Replace inf with nan, then use nanmean (ignores both nan and inf)
+        roi_values[~np.isfinite(roi_values)] = np.nan
+        
+        # Compute average, ignoring nan/inf values
+        avg = np.nanmean(roi_values)
+        avg_thickness_series.append(avg)
 
     return np.asarray(avg_thickness_series)
+
+
+
+def load_corrected_images_with_time(corrected_dir, tag_id=65002, r0=None, x0=None, y0=None):
+    records = []
+    for fname in sorted(os.listdir(corrected_dir)):
+        path = os.path.join(corrected_dir, fname)
+        if not os.path.isfile(path):
+            continue
+        # Try to open as TIFF (works even if no extension)
+        try:
+            with tifffile.TiffFile(path) as tif:
+                img = tif.asarray()
+                if r0 is not None and x0 is not None and y0 is not None:
+                    y_start = max(0, y0 - r0)
+                    y_end = min(img.shape[0], y0 + r0)
+                    x_start = max(0, x0 - r0)
+                    x_end = min(img.shape[1], x0 + r0)
+                    img = img[y_start:y_end, x_start:x_end]
+                tags = tif.pages[0].tags
+                if tag_id not in tags:
+                    continue
+                dt_str = tags[tag_id].value
+        except Exception:
+            continue
+
+        # Parse datetime
+        try:
+            dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+
+        records.append((dt, img, path))
+
+    records.sort(key=lambda x: x[0])
+    img_datetimes = [r[0] for r in records]
+    img_series = [r[1] for r in records]
+    paths = [r[2] for r in records]
+    return img_datetimes, img_series, paths
+
+
 
 def plot_potential_and_thickness(
     echem_datetime_series,
@@ -807,6 +650,7 @@ def plot_potential_and_thickness(
     label_start=0,
     event_marker_size=3,
     event_label_fontsize=10,
+    show=True,
 ):
     """
     Plot potential, electrochemical thickness, and image-derived average thickness
@@ -898,7 +742,14 @@ def plot_potential_and_thickness(
         ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc="best")
     else:
         ax1.legend(loc="best")
-
+    
     plt.tight_layout()
-    plt.show()
+    if show:
+        plt.show()
+    return fig
 
+    
+    
+    
+    
+    

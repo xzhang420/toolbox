@@ -471,17 +471,44 @@ def correct_and_save_tiff(
     compute_dtype=np.float32,
     output_dtype=np.float32,
 ):
+    """
+    Apply intensity correction to a TIFF image and save with metadata.
+    Includes protection against zero/low beam conditions.
+    """
+
+    # Load image
     with tifffile.TiffFile(src_path) as tif:
         img = tif.asarray()
 
-    corrected = np.asarray(img, dtype=compute_dtype) / float(correction_factor)
-    if reference_image is not None:
+    img = np.asarray(img, dtype=compute_dtype)
+
+    # ------------------------------------------------------------------
+    # Beam intensity correction with low-beam protection
+    # ------------------------------------------------------------------
+
+    LOW_BEAM_THRESHOLD = 1e-6  # relative threshold
+
+    if (not np.isfinite(correction_factor)) or (correction_factor <= LOW_BEAM_THRESHOLD):
+        print(f"Low/zero beam detected for {src_path} → writing dark image")
+        corrected = np.zeros_like(img, dtype=compute_dtype)
+        low_beam_flag = True
+    else:
+        corrected = img / float(correction_factor)
+        low_beam_flag = False
+
+    # ------------------------------------------------------------------
+    # Pixel-wise reference normalization (only if valid beam)
+    # ------------------------------------------------------------------
+
+    if reference_image is not None and not low_beam_flag:
         if corrected.shape != reference_image.shape:
             raise ValueError(
                 f"Reference image shape {reference_image.shape} does not match "
                 f"image shape {corrected.shape} for {src_path}."
             )
+
         safe_ref = np.asarray(reference_image, dtype=compute_dtype)
+
         corrected = np.divide(
             corrected,
             safe_ref,
@@ -489,28 +516,76 @@ def correct_and_save_tiff(
             where=safe_ref != 0,
         )
 
-    # Add custom metadata
-    # Use private TIFF tags to avoid KeyError with custom tag names
-    # 65000: AcquisitionTime, 65001: BeamCorrectionFactor, 65002: MeanTPXModifiedTime
+    # ------------------------------------------------------------------
+    # Private TIFF tags
+    # ------------------------------------------------------------------
+
     extratags = [
-        (65001, "d", 1, float(correction_factor), False),
+        (65001, "d", 1, float(correction_factor), False),  # BeamCorrectionFactor
     ]
+
     if acquisition_time is not None:
         extratags.append(
-            (65000, "s", 0, acquisition_time.strftime("%Y-%m-%d %H:%M:%S"), False)
+            (
+                65000,
+                "s",
+                0,
+                acquisition_time.strftime("%Y-%m-%d %H:%M:%S"),
+                False,
+            )
         )
+
     if mean_tpx_modified_time is not None:
         extratags.append(
-            (65002, "s", 0, mean_tpx_modified_time.strftime("%Y-%m-%d %H:%M:%S"), False)
+            (
+                65002,
+                "s",
+                0,
+                mean_tpx_modified_time.strftime("%Y-%m-%d %H:%M:%S"),
+                False,
+            )
         )
+
+    # Optional: flag low-beam frames
+    if low_beam_flag:
+        extratags.append((65003, "s", 0, "LOW_BEAM", False))
+
+    # ------------------------------------------------------------------
+    # Human-readable metadata (ImageJ)
+    # ------------------------------------------------------------------
+
+    desc_lines = []
+
+    if acquisition_time is not None:
+        desc_lines.append(
+            f"AcquisitionTime: {acquisition_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+    desc_lines.append(f"BeamCorrectionFactor: {float(correction_factor)}")
+
+    if mean_tpx_modified_time is not None:
+        desc_lines.append(
+            f"MeanTPXModifiedTime: {mean_tpx_modified_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+    if low_beam_flag:
+        desc_lines.append("NOTE: Low/zero beam - image set to zero")
+
+    description = "\n".join(desc_lines)
+
+    # ------------------------------------------------------------------
+    # Write TIFF
+    # ------------------------------------------------------------------
 
     tifffile.imwrite(
         dst_path,
         corrected.astype(output_dtype),
-        extratags=extratags
+        extratags=extratags,
+        description=description,
     )
-
-
+    
+    
+    
 # =============================================================================
 # High-level intensity correction pipeline
 # =============================================================================
@@ -554,123 +629,158 @@ For each run, this function:
 """
 def intensity_correct_experiment(
     exp_dir,
-    image_dir=None,
-    output_dir=None,
-    beamhistory_path=None,
-    exposure_seconds=2,
-    reference_beam_integral_per_minute=None,
-    reference_dir=None,
-    reference_beamhistory_path=None,
-    processed_reference_image=None,
+    output_dir,
+    beamhistory_path,
+    exposure_seconds,
+    reference_beam_integral_per_minute,
+    reference_image=None,
     compute_dtype=np.float32,
     corrected_output_dtype=np.float32,
+    n_tpx_per_image=30,   # <-- NEW (important)
+    verbose=True,         # <-- NEW
 ):
-    beamhistory = load_beamhistory(beamhistory_path)
+    """
+    Apply intensity correction using grouped TPX files per image.
+    """
 
-    if reference_beam_integral_per_minute is None:
-        if reference_dir and reference_beamhistory_path:
-            reference_beam_integral_per_minute = compute_reference_beam_integral_per_minute(
-                reference_dir,
-                reference_beamhistory_path,
-                exposure_seconds,
-            )
-        else:
-            raise ValueError(
-                "Provide reference_beam_integral_per_minute or "
-                "reference_dir and reference_beamhistory_path."
-            )
-    elif reference_beam_integral_per_minute <= 0:
-        raise ValueError(
-            "reference_beam_integral_per_minute must be a positive value."
-        )
+    beamhistory = load_beamhistory(beamhistory_path)
+    os.makedirs(output_dir, exist_ok=True)
+
+    beam_log = []
 
     for run_dir in sorted(os.listdir(exp_dir)):
-        tpx_folder = os.path.join(exp_dir, run_dir, "tpx3Files")
-        if not os.path.isdir(tpx_folder):
+
+        run_path = os.path.join(exp_dir, run_dir)
+        if not os.path.isdir(run_path):
             continue
 
-        if image_dir is None:
-            image_dir_run = os.path.join(exp_dir, run_dir, "final")
-        else:
-            image_dir_run = image_dir
+        tpx_folder = os.path.join(run_path, "tpx3Files")
+        image_folder = os.path.join(run_path, "final")
 
-        run_beam_integral_per_minute, mean_tpx_time = compute_run_metrics(
-            beamhistory, tpx_folder, exposure_seconds, context=run_dir
-        )
-        if not np.isfinite(run_beam_integral_per_minute):
-            warnings.warn(
-                f"No TPX files found for run {run_dir}; skipping correction."
-            )
+        if not os.path.isdir(tpx_folder) or not os.path.isdir(image_folder):
             continue
 
-        correction_factor = compute_intensity_correction(
-            run_beam_integral_per_minute, reference_beam_integral_per_minute
-        )
+        exposure_times = get_exposure_times(tpx_folder)
+        image_files = sorted([
+            f for f in os.listdir(image_folder)
+            if os.path.isfile(os.path.join(image_folder, f)) and is_tiff_file(os.path.join(image_folder, f))
+        ])
 
-        image_files = [
-            f for f in sorted(os.listdir(image_dir_run))
-            if is_tiff_file(os.path.join(image_dir_run, f))
-        ]
-        if len(image_files) == 0:
-            warnings.warn(f"No TIFF images found in {image_dir_run}; skipping run.")
+        if len(exposure_times) == 0 or len(image_files) == 0:
             continue
 
-        skipped_in_run = 0
-        for img_file in image_files:
-            src = os.path.join(image_dir_run, img_file)
-            dst_name = f"{run_dir}_corrected_{img_file}"
-            dst = os.path.join(output_dir, dst_name)
-            if os.path.exists(dst):
-                skipped_in_run += 1
+        # --- GROUP TPX FILES PER IMAGE ---
+        beam_integrals_per_image = []
+        grouped_times = []
+
+        for i in range(0, len(exposure_times), n_tpx_per_image):
+            group = exposure_times[i:i+n_tpx_per_image]
+
+            if len(group) == 0:
                 continue
 
+            integrals = integrate_beam(beamhistory, group, exposure_seconds)
+
+            mean_integral = float(np.mean(integrals))
+            beam_integrals_per_image.append(mean_integral)
+            grouped_times.append(mean_datetime(group))
+
+        beam_integrals_per_image = np.array(beam_integrals_per_image)
+
+        # --- CORRECTION FACTORS ---
+        correction_factors = beam_integrals_per_image / reference_beam_integral_per_minute
+
+        # --- DEBUG PRINT ---
+        if verbose:
+            print(f"\n[RUN {run_dir}]")
+            print(f"  TPX files: {len(exposure_times)}")
+            print(f"  Images: {len(image_files)}")
+            print(f"  Groups formed: {len(beam_integrals_per_image)}")
+
+        # --- SAFETY CHECK ---
+        if len(image_files) != len(correction_factors):
+            print(f"WARNING: mismatch in run {run_dir}")
+            print(f"  Images: {len(image_files)}, Beam groups: {len(correction_factors)}")
+
+        # --- PROCESS IMAGES ---
+        for i, fname in enumerate(image_files):
+
+            if i >= len(correction_factors):
+                print(f"Skipping extra image: {fname}")
+                break
+
+            src = os.path.join(image_folder, fname)
+            dst = os.path.join(output_dir, fname)
+
+            cf = float(correction_factors[i])
+            bi = float(beam_integrals_per_image[i])
+            acq_time = grouped_times[i]
+
+            # --- DEBUG PRINT PER IMAGE ---
+            if verbose:
+                print(f"[{i}] {fname}")
+                print(f"    Beam integral (avg of TPX): {bi:.3f}")
+                print(f"    Correction factor: {cf:.6f}")
+
+            beam_log.append({
+                "run": run_dir,
+                "image_index": i,
+                "filename": fname,
+                "time": acq_time,
+                "beam_integral": bi,
+                "relative_factor": cf,
+            })
+
             correct_and_save_tiff(
-                src,
-                dst,
-                correction_factor,
-                mean_tpx_time,
-                mean_tpx_time,
-                reference_image=processed_reference_image,
+                src_path=src,
+                dst_path=dst,
+                correction_factor=cf,
+                acquisition_time=acq_time,
+                reference_image=reference_image,
                 compute_dtype=compute_dtype,
                 output_dtype=corrected_output_dtype,
             )
-        if skipped_in_run:
-            warnings.warn(
-                f"Skipped {skipped_in_run} existing corrected files in run {run_dir}."
-            )
 
+    return beam_log
 
 # =============================================================================
-# Collect TIFF files from run folders
+# Collect TIFF files from run folders (fixed)
 # =============================================================================
-"""
-Copy TIFF files from each run's "final" folder into a new output folder and
-prefix filenames with the run folder name.
-
-Parameters
-----------
-exp_dir : str
-    Root directory containing run folders (e.g., exp604_..._00075).
-output_folder_name : str, optional
-    Name of output folder created alongside exp_dir.
-final_subfolder : str, optional
-    Subfolder name containing TIFF files (default "final").
-tiff_extensions : tuple of str, optional
-    TIFF extensions to include (default (".tif", ".tiff")).
-
-Returns
--------
-str
-    Path to the output folder containing copied TIFFs with run-prefixed filenames.
-"""
 def collect_and_copy_tiffs(
     exp_dir,
-    output_folder_name="uncorrected",
+    output_dir=None,
     final_subfolder="final",
     tiff_extensions=(".tif", ".tiff"),
+    file_filter=None,
 ):
+    """
+    Copy TIFF files from each run's "final" folder into a new output folder and
+    prefix filenames with the run folder name.
+
+    Parameters
+    ----------
+    exp_dir : str
+        Root directory containing run folders.
+    output_dir : str, optional
+        Path to output folder. If None, creates 'obint_uncorrected_<exp_name>' alongside exp_dir.
+    final_subfolder : str, optional
+        Subfolder name containing TIFF files (default 'final').
+    tiff_extensions : tuple of str, optional
+        TIFF extensions to include.
+    file_filter : str or None
+        Optional substring that must appear in the filename.
+
+    Returns
+    -------
+    str
+        Path to the output folder containing copied TIFFs.
+    """
+
+    exp_name = os.path.basename(os.path.abspath(exp_dir))
     parent_dir = os.path.dirname(os.path.abspath(exp_dir))
-    output_dir = os.path.join(parent_dir, output_folder_name)
+
+    if output_dir is None:
+        output_dir = os.path.join(parent_dir, f"obint_uncorrected_{exp_name}")
     os.makedirs(output_dir, exist_ok=True)
 
     for run_dir in sorted(os.listdir(exp_dir)):
@@ -688,11 +798,16 @@ def collect_and_copy_tiffs(
 
         tiff_files = [
             f for f in sorted(os.listdir(final_dir))
-            if is_tiff_file(os.path.join(final_dir, f))
+            if (is_tiff_file(os.path.join(final_dir, f)) and
+                (file_filter is None or file_filter in f))
         ]
+
         if len(tiff_files) == 0:
-            warnings.warn(f"No TIFF images found in {final_dir}; skipping run.")
+            warnings.warn(
+                f"No TIFF images found in {final_dir} matching filter '{file_filter}'; skipping run."
+            )
             continue
+
         if not exposure_times:
             warnings.warn(
                 f"No TPX files found for run {run_dir}; uncorrected copies will "
@@ -706,7 +821,6 @@ def collect_and_copy_tiffs(
             copy_tiff_with_metadata(src, dst, mean_tpx_time)
 
     return output_dir
-
 
 # =============================================================================
 # Copy TIFF with metadata
@@ -743,14 +857,13 @@ def copy_tiff_with_metadata(src_path, dst_path, mean_tpx_modified_time=None):
 # =============================================================================
 # Capacity events and nearest image indices
 # =============================================================================
-def find_capacity_turning_points_and_zeros(
+def find_capacity_turning_points(
     echem_datetimes,
     capacity_series,
-    zero_tol=1e-9,
-    only_initial_zero=True,
 ):
     """
-    Find timestamps of turning points and zero crossings in Capacity/mA.h.
+    Find timestamps of turning points in Capacity/mA.h.
+    (No zero detection, no automatic last event.)
 
     Parameters
     ----------
@@ -758,56 +871,44 @@ def find_capacity_turning_points_and_zeros(
         Electrochemical time series.
     capacity_series : array-like
         Capacity/mA.h values aligned with echem_datetimes.
-    zero_tol : float, optional
-        Absolute tolerance for considering a value as zero.
 
     Returns
     -------
     events : list of dict
         Each dict has keys: 'index', 'time', 'labels'.
-        labels contains any of: {"zero", "turning"}.
+        labels contains: {"turning"}.
     """
     times = np.asarray(echem_datetimes)
     cap = np.asarray(capacity_series, dtype=float)
 
-    if len(cap) == 0:
+    if len(cap) < 3:
         return []
+
+    if len(times) != len(cap):
+        raise ValueError("echem_datetimes and capacity_series must have the same length.")
 
     labels_by_idx = {}
 
-    # Zero values and sign changes
-    zero_idx = set(np.where(np.abs(cap) <= zero_tol)[0].tolist())
-    if len(cap) > 1:
-        sign = np.sign(cap)
-        sign[sign == 0] = np.nan
-        prod = np.nan_to_num(sign[:-1]) * np.nan_to_num(sign[1:])
-        sign_change_idx = set((np.where(prod < 0)[0] + 1).tolist())
-        zero_idx |= sign_change_idx
-
-    if only_initial_zero and zero_idx:
-        zero_idx = {min(zero_idx)}
-
-    for idx in zero_idx:
-        labels_by_idx.setdefault(idx, set()).add("zero")
-
     # Turning points (sign change in first derivative)
-    if len(cap) > 2:
-        d = np.diff(cap)
-        sign_d = np.sign(d)
-        sign_d[sign_d == 0] = np.nan
-        prod_d = np.nan_to_num(sign_d[:-1]) * np.nan_to_num(sign_d[1:])
-        turning_idx = set((np.where(prod_d < 0)[0] + 1).tolist())
-        for idx in turning_idx:
-            labels_by_idx.setdefault(idx, set()).add("turning")
+    d = np.diff(cap)
+    sign_d = np.sign(d)
+    sign_d[sign_d == 0] = np.nan
+    prod_d = np.nan_to_num(sign_d[:-1]) * np.nan_to_num(sign_d[1:])
+    turning_idx = set((np.where(prod_d < 0)[0] + 1).tolist())
+
+    for idx in turning_idx:
+        labels_by_idx.setdefault(idx, set()).add("turning")
 
     events = []
     for idx in sorted(labels_by_idx.keys()):
         events.append({
             "index": int(idx),
             "time": times[idx],
-            "labels": sorted(labels_by_idx[idx]),
+            "labels": ["turning"],
         })
+
     return events
+
 
 
 def find_nearest_image_indices(event_times, img_datetimes):
@@ -840,45 +941,8 @@ def find_nearest_image_indices(event_times, img_datetimes):
 
 
 # =============================================================================
-# High-level pipeline function
+# High-level pipeline function (fixed)
 # =============================================================================
-"""
-Run the full operando correction workflow.
-
-Parameters
-----------
-exp_dir : str
-    Root directory containing run folders (e.g., exp604_..._00075).
-beamhistory_path : str
-    Path to the .dat file containing beam history for operando data.
-output_dir : str, optional
-    Directory where corrected images will be saved. If None, creates an
-    "obint_corrected_<experiment_folder_name>" folder alongside exp_dir.
-exposure_seconds : int or float, optional
-    Duration of each exposure in seconds (default 2).
-reference_dir : str
-    Root directory containing reference runs (same structure as operando data).
-reference_beamhistory_path : str
-    Path to the .dat file containing beam history for the reference data.
-uncorrected_output_folder_name : str, optional
-    Output folder name for uncorrected TIFFs. If None, creates an
-    "uncorrected_<experiment_folder_name>" folder alongside exp_dir.
-reference_bin_y : int, optional
-    Vertical binning factor used to process reference images.
-reference_bin_x : int, optional
-    Horizontal binning factor used to process reference images.
-reference_final_subfolder : str, optional
-    Subfolder name inside each reference run containing TIFF images.
-compute_dtype : data-type, optional
-    Floating-point dtype used in intermediate calculations.
-corrected_output_dtype : data-type, optional
-    Floating-point dtype used when writing corrected TIFFs.
-
-Returns
--------
-dict
-    Summary with keys: "corrected_dir", "uncorrected_dir", "reference_beam_integral_per_minute".
-"""
 def run_operando_pipeline(
     exp_dir,
     beamhistory_path,
@@ -892,25 +956,39 @@ def run_operando_pipeline(
     reference_final_subfolder="final",
     compute_dtype=np.float32,
     corrected_output_dtype=np.float32,
+    file_filter=None,
 ):
+    """
+    Run the full operando intensity correction workflow.
+
+    Returns a dict with paths to corrected, uncorrected directories, reference beam,
+    and per-frame beam log.
+    """
+
+    exp_name = os.path.basename(os.path.abspath(exp_dir))
+    parent_dir = os.path.dirname(os.path.abspath(exp_dir))
+
+    results_dir = os.path.join(parent_dir, f"results_{exp_name}")
+    os.makedirs(results_dir, exist_ok=True)
+
     if reference_dir is None or reference_beamhistory_path is None:
         raise ValueError(
             "reference_dir and reference_beamhistory_path are required to compute "
             "reference_beam_integral_per_minute."
         )
 
-    exp_name = os.path.basename(os.path.abspath(exp_dir))
     if output_dir is None:
-        parent_dir = os.path.dirname(os.path.abspath(exp_dir))
-        output_dir = os.path.join(parent_dir, f"obint_corrected_{exp_name}")
+        output_dir = os.path.join(results_dir, "corrected")
     os.makedirs(output_dir, exist_ok=True)
 
+    print("Computing reference beam integral per minute...")
     reference_beam_integral_per_minute = compute_reference_beam_integral_per_minute(
         reference_dir,
         reference_beamhistory_path,
         exposure_seconds,
     )
 
+    print("Loading reference images...")
     ref_series = load_reference_image_series(
         reference_dir,
         final_subfolder=reference_final_subfolder,
@@ -921,6 +999,8 @@ def run_operando_pipeline(
             "No reference TIFF images found. "
             "Check reference_dir and reference_final_subfolder."
         )
+
+    print("Processing reference images...")
     processed_reference_image = process_reference_images(
         ref_series,
         bin_y=reference_bin_y,
@@ -930,28 +1010,231 @@ def run_operando_pipeline(
 
     if uncorrected_output_folder_name is None:
         uncorrected_output_folder_name = f"uncorrected_{exp_name}"
+
+    print("Collecting uncorrected TIFFs...")
     uncorrected_dir = collect_and_copy_tiffs(
         exp_dir,
-        output_folder_name=uncorrected_output_folder_name,
+        output_dir=os.path.join(parent_dir, uncorrected_output_folder_name),
+        file_filter=file_filter,
     )
 
-    intensity_correct_experiment(
+    print("Applying intensity correction to operando images...")
+    beam_log = intensity_correct_experiment(
         exp_dir=exp_dir,
-        image_dir=None,
         output_dir=output_dir,
         beamhistory_path=beamhistory_path,
         exposure_seconds=exposure_seconds,
         reference_beam_integral_per_minute=reference_beam_integral_per_minute,
-        reference_dir=reference_dir,
-        reference_beamhistory_path=reference_beamhistory_path,
-        processed_reference_image=processed_reference_image,
+        reference_image=processed_reference_image,
         compute_dtype=compute_dtype,
         corrected_output_dtype=corrected_output_dtype,
     )
 
     return {
+        "results_dir": results_dir,
         "corrected_dir": output_dir,
         "uncorrected_dir": uncorrected_dir,
         "reference_beam_integral_per_minute": reference_beam_integral_per_minute,
+        "beam_log": beam_log,
     }
+    
+    
+
+def compute_background_image(
+    image_dir,
+    n_images=15,
+    compute_dtype=np.float32,
+):
+    """
+    Compute a background image by taking the median of the first n_images in a directory,
+    ignoring images that are entirely zero.
+
+    Parameters
+    ----------
+    image_dir : str
+        Directory containing TIFF images.
+    n_images : int, optional
+        Number of images to consider from the start (default = 15).
+    compute_dtype : numpy dtype
+        Data type used for computation.
+
+    Returns
+    -------
+    np.ndarray
+        Background image (float32 by default).
+    """
+
+    import os
+    import numpy as np
+    import tifffile
+
+    files = sorted(os.listdir(image_dir))
+
+    valid_images = []
+    count_checked = 0
+
+    for fname in files:
+        path = os.path.join(image_dir, fname)
+
+        if not os.path.isfile(path) or not is_tiff_file(path):
+            continue
+
+        # Stop after checking n_images valid files (not counting skipped non-TIFFs)
+        if count_checked >= n_images:
+            break
+
+        try:
+            img = tifffile.imread(path).astype(compute_dtype)
+        except Exception:
+            continue
+
+        count_checked += 1
+
+        # Skip all-zero images
+        if np.all(img == 0):
+            print(f"Skipping zero image: {fname}")
+            continue
+
+        valid_images.append(img)
+
+    if len(valid_images) == 0:
+        raise ValueError("No valid (non-zero) images found for background computation.")
+
+    # Stack and average
+    stack = np.stack(valid_images, axis=0)
+    background = np.median(stack, axis=0)
+
+    print(f"Background computed from {len(valid_images)} images (out of {count_checked} checked).")
+
+    return background.astype(compute_dtype)
+
+
+# =============================================================================
+# Background subtraction (post-processing step)
+# =============================================================================
+"""
+Background subtraction for corrected operando images.
+
+This step is intended to be run AFTER intensity correction, once a suitable
+background image has been constructed.
+
+It preserves the custom TIFF metadata used throughout the pipeline.
+"""
+
+
+def read_custom_tags(path):
+    try:
+        with tifffile.TiffFile(path) as tif:
+            tags = tif.pages[0].tags
+            return {
+                code: tags[code].value
+                for code in (65000, 65001, 65002)
+                if code in tags
+            }
+    except Exception:
+        return {}
+
+
+def background_subtract_and_save(
+    src_path,
+    dst_path,
+    background_image,
+    clip_negatives=True,
+    compute_dtype=np.float32,
+    output_dtype=np.float32,
+):
+    """
+    Subtract background from a single TIFF and preserve metadata.
+    """
+
+    # Load image
+    img = tifffile.imread(src_path).astype(compute_dtype)
+
+    if img.shape != background_image.shape:
+        raise ValueError(
+            f"Background shape {background_image.shape} does not match "
+            f"image shape {img.shape} for {src_path}"
+        )
+
+    # Subtract background
+    bgsub = img - background_image
+
+    if clip_negatives:
+        bgsub = np.maximum(bgsub, 0)
+
+    # Preserve metadata
+    tags = read_custom_tags(src_path)
+    extratags = []
+
+    if 65001 in tags:
+        extratags.append((65001, "d", 1, float(tags[65001]), False))
+    if 65000 in tags:
+        extratags.append((65000, "s", 0, str(tags[65000]), False))
+    if 65002 in tags:
+        extratags.append((65002, "s", 0, str(tags[65002]), False))
+
+    tifffile.imwrite(
+        dst_path,
+        bgsub.astype(output_dtype),
+        extratags=extratags,
+    )
+
+
+def background_subtract_directory(
+    input_dir,
+    output_dir,
+    background_path,
+    clip_negatives=True,
+    skip_existing=True,
+    compute_dtype=np.float32,
+    output_dtype=np.float32,
+):
+    """
+    Apply background subtraction to all TIFF images in a directory.
+
+    Parameters
+    ----------
+    input_dir : str
+        Directory containing corrected TIFF images.
+    output_dir : str
+        Directory where background-subtracted images will be written.
+    background_path : str
+        Path to background TIFF image.
+    clip_negatives : bool, optional
+        Whether to clip negative values to zero.
+    skip_existing : bool, optional
+        Skip files that already exist in output_dir.
+    """
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load background once
+    background_image = tifffile.imread(background_path).astype(compute_dtype)
+
+    files = sorted(os.listdir(input_dir))
+
+    for i, fname in enumerate(files, 1):
+        src = os.path.join(input_dir, fname)
+
+        if not os.path.isfile(src) or not is_tiff_file(src):
+            continue
+
+        dst = os.path.join(output_dir, fname)
+
+        if skip_existing and os.path.exists(dst):
+            continue
+
+        print(f"[{i}/{len(files)}] {fname}")
+
+        try:
+            background_subtract_and_save(
+                src,
+                dst,
+                background_image,
+                clip_negatives=clip_negatives,
+                compute_dtype=compute_dtype,
+                output_dtype=output_dtype,
+            )
+        except Exception as e:
+            print(f"Skipping {fname}: {e}")
 
