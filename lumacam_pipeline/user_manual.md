@@ -69,6 +69,16 @@ click **Load images** so the corrected stack is loaded.
 
 - For correction, supply any available beam-history and reference paths, then
   click **Run corrections**. Missing optional paths do not stop processing.
+- If reduction preserved but excluded a failed final TPX3 frame, the pipeline
+  reads `processing_exclusions.json` automatically and omits the same interval
+  from the beam integral. It also uses the included/planned exposure fraction
+  in the correction factor, preventing a shortened TIFF from being treated as
+  a full-duration image. The correction CSV records the total and per-TPX3 beam
+  integrals, exposure fraction, and included/excluded frame details.
+- Reference/OB TIFFs are normalized in the same way before they are averaged
+  whenever a reference beam-history file is supplied.
+- Runs marked as whole-run exclusions are omitted automatically, even if stale
+  derived TIFFs still exist. Their raw TPX3 files remain retained.
 - Enable and run background correction only when needed.
 - After loading images, optionally click **Measure images**.
 - Select images and save an image figure or video from the output section.

@@ -2,6 +2,7 @@
 
 import os
 import json
+import math
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -12,6 +13,7 @@ import warnings
 V2_LAYOUT_MARKER = os.path.join("metadata", "layout.json")
 V2_DATA_TREES = {"tpx3Files", "final", "derived", "metadata"}
 EXPOSURE_MANIFEST_FILENAME = "tpx3_exposure_manifest.json"
+PROCESSING_EXCLUSIONS_FILENAME = "processing_exclusions.json"
 ACQUISITION_METADATA_FILENAME = "acquisition.json"
 EXPERIMENT_METADATA_FILENAME = "experiment.json"
 
@@ -165,7 +167,13 @@ def resolve_nci_experiment(exp_dir, final_subfolder="final"):
             ]
 
         runs = []
+        excluded_runs = []
         for run_name in sorted(run_names):
+            metadata_dir = os.path.join(metadata_root, run_name)
+            run_exclusion = load_run_processing_exclusion(metadata_dir)
+            if run_exclusion is not None:
+                excluded_runs.append(run_name)
+                continue
             old_image_dir = os.path.join(image_root, run_name)
             image_files = []
             if os.path.isdir(old_image_dir):
@@ -195,7 +203,7 @@ def resolve_nci_experiment(exp_dir, final_subfolder="final"):
                     "image_dir": image_dir,
                     "image_files": image_files,
                     "tpx_dir": os.path.join(tpx3_root, run_name),
-                    "metadata_dir": os.path.join(metadata_root, run_name),
+                    "metadata_dir": metadata_dir,
                     "layout_type": "v2",
                 }
             )
@@ -205,6 +213,7 @@ def resolve_nci_experiment(exp_dir, final_subfolder="final"):
             "experiment": experiment,
             "experiment_dir": image_root,
             "runs": runs,
+            "excluded_runs": excluded_runs,
         }
 
     # A legacy run itself may be supplied instead of its experiment parent.
@@ -593,6 +602,175 @@ def load_exposure_manifest(metadata_dir):
     return payload
 
 
+def load_processing_exclusions(metadata_dir, exposure_manifest):
+    """Load and validate frames deliberately omitted during reconstruction.
+
+    The exclusion sidecar is meaningful only together with the exact exposure
+    manifest whose filenames and timing windows it references. Invalid or
+    inconsistent metadata is rejected so beam normalization cannot silently
+    integrate a raw interval that did not contribute to the reconstructed TIFF.
+    """
+    if metadata_dir is None:
+        return None
+    path = os.path.join(str(metadata_dir), PROCESSING_EXCLUSIONS_FILENAME)
+    if not os.path.isfile(path):
+        return None
+    if exposure_manifest is None:
+        raise ValueError(
+            f"Processing exclusions require {EXPOSURE_MANIFEST_FILENAME}: {path}"
+        )
+    payload = _read_json_object(path, "processing exclusions")
+    if (
+        payload.get("schema") != "lumacam-processing-exclusions"
+        or payload.get("schema_version") != 1
+    ):
+        raise ValueError(f"Unsupported processing-exclusion schema: {path}")
+    if payload.get("raw_tpx3_retained") is not True:
+        raise ValueError(f"Processing exclusions do not confirm retained raw data: {path}")
+
+    manifest_frames = exposure_manifest["frames"]
+    manifest_by_name = {frame.get("file_name"): frame for frame in manifest_frames}
+    excluded_frames = payload.get("excluded_frames")
+    if not isinstance(excluded_frames, list) or not excluded_frames:
+        raise ValueError(f"Processing exclusions contain no excluded frames: {path}")
+    excluded_names = []
+    for excluded in excluded_frames:
+        if not isinstance(excluded, dict):
+            raise ValueError(f"Processing exclusions contain a non-object frame: {path}")
+        name = excluded.get("file_name")
+        manifest_frame = manifest_by_name.get(name)
+        if manifest_frame is None:
+            raise ValueError(
+                f"Excluded frame {name!r} is absent from the exposure manifest: {path}"
+            )
+        if name in excluded_names:
+            raise ValueError(f"Processing exclusions contain duplicate frame {name!r}: {path}")
+        if (
+            excluded.get("start_unix_ns") != manifest_frame.get("start_unix_ns")
+            or excluded.get("end_unix_ns") != manifest_frame.get("end_unix_ns")
+        ):
+            raise ValueError(
+                f"Excluded frame timing does not match the exposure manifest for {name}: {path}"
+            )
+        if not str(excluded.get("reason", "")).strip():
+            raise ValueError(f"Excluded frame {name!r} has no reason: {path}")
+        excluded_names.append(name)
+
+    input_count = len(manifest_frames)
+    excluded_count = len(excluded_names)
+    if (
+        payload.get("input_frame_count") != input_count
+        or payload.get("excluded_frame_count") != excluded_count
+        or payload.get("processed_frame_count") != input_count - excluded_count
+    ):
+        raise ValueError(f"Processing-exclusion frame counts are inconsistent: {path}")
+    manifest_duration = sum(
+        (frame["end_unix_ns"] - frame["start_unix_ns"]) / 1e9
+        for frame in manifest_frames
+    )
+    excluded_duration = sum(
+        (manifest_by_name[name]["end_unix_ns"] - manifest_by_name[name]["start_unix_ns"])
+        / 1e9
+        for name in excluded_names
+    )
+    included_duration = manifest_duration - excluded_duration
+    duration_fields = {
+        "input_effective_exposure_s": manifest_duration,
+        "excluded_effective_exposure_s": excluded_duration,
+        "included_effective_exposure_s": included_duration,
+    }
+    for field, expected in duration_fields.items():
+        try:
+            actual = float(payload[field])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"Processing exclusions have invalid {field}: {path}") from error
+        if not np.isclose(actual, expected, rtol=0, atol=1e-6):
+            raise ValueError(f"Processing exclusions have inconsistent {field}: {path}")
+    payload = dict(payload)
+    payload["metadata_path"] = path
+    payload["excluded_file_names"] = excluded_names
+    return payload
+
+
+def load_run_processing_exclusion(metadata_dir):
+    """Return validated metadata when reduction deliberately omitted a whole run."""
+    if metadata_dir is None or not os.path.isfile(
+        os.path.join(str(metadata_dir), PROCESSING_EXCLUSIONS_FILENAME)
+    ):
+        return None
+    manifest = load_exposure_manifest(metadata_dir)
+    exclusions = load_processing_exclusions(metadata_dir, manifest)
+    if exclusions is None or exclusions.get("run_excluded") is not True:
+        return None
+    manifest_names = [frame.get("file_name") for frame in manifest["frames"]]
+    if set(exclusions["excluded_file_names"]) != set(manifest_names):
+        raise ValueError(
+            "Whole-run processing exclusion does not list every TPX3 frame: "
+            f"{exclusions['metadata_path']}"
+        )
+    if not np.isclose(
+        float(exclusions["included_effective_exposure_s"]), 0.0, rtol=0, atol=1e-9
+    ):
+        raise ValueError(
+            "Whole-run processing exclusion has non-zero included exposure: "
+            f"{exclusions['metadata_path']}"
+        )
+    return exclusions
+
+
+def _positive_float(value):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if np.isfinite(result) and result > 0 else None
+
+
+def _nominal_effective_exposure_s(exposure_manifest, metadata_dir):
+    """Resolve the intended detector-open time represented by one run TIFF."""
+    acquisition = None
+    if metadata_dir is not None:
+        acquisition_path = os.path.join(
+            str(metadata_dir), ACQUISITION_METADATA_FILENAME
+        )
+        if os.path.isfile(acquisition_path):
+            acquisition = _read_json_object(acquisition_path, "acquisition metadata")
+            planned = _positive_float(acquisition.get("planned_effective_exposure_s"))
+            if planned is not None:
+                return planned
+
+    planned = _positive_float(exposure_manifest.get("planned_effective_exposure_s"))
+    if planned is not None:
+        return planned
+
+    requested = _positive_float(exposure_manifest.get("requested_measurement_time_s"))
+    detector = exposure_manifest.get("detector_configuration")
+    if requested is not None and isinstance(detector, dict):
+        exposure = _positive_float(detector.get("exposure_time_s"))
+        period = _positive_float(detector.get("trigger_period_s"))
+        if exposure is not None and period is not None and exposure <= period:
+            remaining_after_first = max(0.0, requested - exposure)
+            frame_count = max(
+                1, 1 + math.ceil(remaining_after_first / period - 1e-12)
+            )
+            return frame_count * exposure
+
+    summary = exposure_manifest.get("summary")
+    summary_duration = _positive_float(
+        summary.get("total_effective_exposure_s")
+        if isinstance(summary, dict)
+        else None
+    )
+    if summary_duration is not None:
+        return summary_duration
+    return float(
+        sum(
+            (frame["end_unix_ns"] - frame["start_unix_ns"]) / 1e9
+            for frame in exposure_manifest["frames"]
+        )
+    )
+
+
 def _read_json_object(path, label):
     """Read a JSON object and report its path in validation errors."""
     try:
@@ -724,8 +902,24 @@ def get_exposure_windows(
     except ValueError as error:
         manifest_error = error
     if manifest is not None:
+        exclusions = load_processing_exclusions(metadata_dir, manifest)
+        excluded_names = set(
+            exclusions["excluded_file_names"] if exclusions is not None else []
+        )
+        manifest_path = os.path.join(str(metadata_dir), EXPOSURE_MANIFEST_FILENAME)
+        exclusions_path = (
+            exclusions["metadata_path"] if exclusions is not None else None
+        )
+        timing_metadata_paths = [manifest_path]
+        if exclusions_path is not None:
+            timing_metadata_paths.append(exclusions_path)
+        nominal_effective_exposure_s = _nominal_effective_exposure_s(
+            manifest, metadata_dir
+        )
         windows = []
         for frame in manifest["frames"]:
+            if frame.get("file_name") in excluded_names:
+                continue
             start = _datetime_from_unix_ns(frame["start_unix_ns"])
             end = _datetime_from_unix_ns(frame["end_unix_ns"])
             midpoint = _datetime_from_unix_ns(
@@ -757,13 +951,39 @@ def get_exposure_windows(
                     "file_name": frame.get("file_name"),
                     "timing_source": frame.get("timing_source", "exposure_manifest"),
                     "timing_quality": frame.get("timing_quality", "unknown"),
-                    "manifest_path": os.path.join(str(metadata_dir), EXPOSURE_MANIFEST_FILENAME),
-                    "metadata_path": os.path.join(str(metadata_dir), EXPOSURE_MANIFEST_FILENAME),
+                    "manifest_path": manifest_path,
+                    "metadata_path": manifest_path,
+                    "timing_metadata_paths": timing_metadata_paths,
+                    "processing_exclusions_path": exclusions_path,
+                    "input_tpx_file_count": len(manifest["frames"]),
+                    "nominal_effective_exposure_s": nominal_effective_exposure_s,
+                    "excluded_tpx_file_count": len(excluded_names),
+                    "excluded_tpx_files": list(exclusions["excluded_file_names"])
+                    if exclusions is not None
+                    else [],
                     "timing_metadata_kind": "exposure_manifest",
                     "tpx_file_count": 1,
                 }
             )
+        if not windows:
+            raise ValueError(
+                f"Processing exclusions omit every exposure in {manifest_path}"
+            )
         return windows
+
+    exclusions_path = (
+        os.path.join(str(metadata_dir), PROCESSING_EXCLUSIONS_FILENAME)
+        if metadata_dir is not None
+        else None
+    )
+    if exclusions_path is not None and os.path.isfile(exclusions_path):
+        if manifest_error is not None:
+            raise ValueError(
+                f"{manifest_error}; cannot safely apply {exclusions_path}"
+            ) from manifest_error
+        raise ValueError(
+            f"Processing exclusions require {EXPOSURE_MANIFEST_FILENAME}: {exclusions_path}"
+        )
 
     metadata_error = None
     try:
@@ -832,6 +1052,57 @@ def get_run_exposure_windows(run, tpx_time=2, extension=".tpx3"):
         tpx_time=tpx_time,
         extension=extension,
     )
+
+
+def exposure_group_provenance(exposure_windows):
+    """Summarize included and explicitly excluded TPX3 inputs for one TIFF."""
+    if not exposure_windows:
+        return {
+            "tpx_file_count": 0,
+            "input_tpx_file_count": 0,
+            "excluded_tpx_file_count": 0,
+            "excluded_tpx_files": [],
+            "processing_exclusions_path": None,
+            "timing_metadata_paths": [],
+            "included_effective_exposure_s": 0.0,
+            "nominal_effective_exposure_s": 0.0,
+            "effective_exposure_fraction": 1.0,
+        }
+    included_count = sum(
+        int(window.get("tpx_file_count", 1)) for window in exposure_windows
+    )
+    metadata_paths = set()
+    for window in exposure_windows:
+        metadata_paths.update(
+            str(path) for path in window.get("timing_metadata_paths", []) if path
+        )
+        if window.get("metadata_path"):
+            metadata_paths.add(str(window["metadata_path"]))
+    first = exposure_windows[0] if exposure_windows else {}
+    excluded_files = list(first.get("excluded_tpx_files", []))
+    included_exposure_s = float(
+        sum(window["duration_s"] for window in exposure_windows)
+    )
+    nominal_exposure_s = float(
+        first.get("nominal_effective_exposure_s", included_exposure_s)
+    )
+    if nominal_exposure_s <= 0 or not np.isfinite(nominal_exposure_s):
+        raise ValueError("Nominal effective exposure must be positive")
+    return {
+        "tpx_file_count": included_count,
+        "input_tpx_file_count": int(
+            first.get("input_tpx_file_count", included_count)
+        ),
+        "excluded_tpx_file_count": int(
+            first.get("excluded_tpx_file_count", len(excluded_files))
+        ),
+        "excluded_tpx_files": excluded_files,
+        "processing_exclusions_path": first.get("processing_exclusions_path"),
+        "timing_metadata_paths": sorted(metadata_paths),
+        "included_effective_exposure_s": included_exposure_s,
+        "nominal_effective_exposure_s": nominal_exposure_s,
+        "effective_exposure_fraction": included_exposure_s / nominal_exposure_s,
+    }
 
 
 def mean_exposure_midpoint(exposure_windows):
@@ -1193,6 +1464,9 @@ def load_reference_image_series(
     final_subfolder="final",
     dtype=np.float32,
     file_filter=None,
+    beamhistory_path=None,
+    reference_beam_integral_per_minute=None,
+    tpx_time=2,
 ):
     """
     Load all 2D reference TIFF images from each run's ``final_subfolder``.
@@ -1214,16 +1488,40 @@ def load_reference_image_series(
         Reference image stack in run/file sort order.
     """
     layout = resolve_nci_experiment(reference_dir, final_subfolder=final_subfolder)
+    correction_factors = {}
+    if (
+        clean_optional_path(beamhistory_path) is not None
+        and _positive_float(reference_beam_integral_per_minute) is not None
+    ):
+        _, correction_plan, intensity_enabled = _correction_plan(
+            reference_dir,
+            beamhistory_path=beamhistory_path,
+            tpx_time=tpx_time,
+            reference_beam_integral_per_minute=reference_beam_integral_per_minute,
+            file_filter=file_filter,
+            final_subfolder=final_subfolder,
+        )
+        if intensity_enabled:
+            correction_factors = {
+                os.path.abspath(row["source_path"]): float(row["relative_factor"])
+                for row in correction_plan
+            }
     ref_series = []
     for run in layout["runs"]:
         for path in _run_image_paths(run, file_filter=file_filter):
             try:
                 img = tifffile.imread(path)
-                if img.ndim != 2:
-                    continue
-                ref_series.append(np.asarray(img, dtype=dtype))
             except Exception:
                 continue
+            if img.ndim != 2:
+                continue
+            image = np.asarray(img, dtype=dtype)
+            factor = correction_factors.get(os.path.abspath(path), 1.0)
+            if not np.isfinite(factor) or factor <= 1e-6:
+                raise ValueError(
+                    f"Reference beam-dose correction factor is invalid for {path}: {factor}"
+                )
+            ref_series.append(image / factor)
     return ref_series
 
 
@@ -1454,6 +1752,38 @@ def mean_beam_integral_for_windows(beamhistory, exposure_windows):
         [window["duration_s"] for window in exposure_windows], dtype=float
     )
     return float(np.average(values, weights=durations))
+
+
+def beam_metrics_for_windows(beamhistory, exposure_windows):
+    """Return average beam level, total dose, and per-TPX3 beam integrals."""
+    values = integrate_beam_windows(beamhistory, exposure_windows)
+    if len(values) == 0:
+        return {
+            "beam_integral_per_minute": np.nan,
+            "total_beam_integral": np.nan,
+            "tpx3_beam_integrals": [],
+        }
+    durations = np.asarray(
+        [window["duration_s"] for window in exposure_windows], dtype=float
+    )
+    total_integrals = values * durations / 60.0
+    details = []
+    for window, per_minute, total in zip(exposure_windows, values, total_integrals):
+        details.append(
+            {
+                "file_name": window.get("file_name"),
+                "start": window["start"].isoformat(),
+                "end": window["end"].isoformat(),
+                "duration_s": float(window["duration_s"]),
+                "beam_integral_per_minute": float(per_minute),
+                "total_beam_integral": float(total),
+            }
+        )
+    return {
+        "beam_integral_per_minute": float(np.average(values, weights=durations)),
+        "total_beam_integral": float(np.sum(total_integrals)),
+        "tpx3_beam_integrals": details,
+    }
 
 
 # =============================================================================
@@ -1831,15 +2161,11 @@ def _correction_plan(
             }.get(timing_kind, timing_kind)
             if timing_source is None:
                 timing_source = "source_tiff_metadata_or_mtime"
-            metadata_paths = sorted({
-                str(window["metadata_path"])
-                for window in group
-                if window.get("metadata_path")
-            })
-            tpx_file_count = sum(
-                int(window.get("tpx_file_count", 1)) for window in group
-            )
+            provenance = exposure_group_provenance(group)
             beam_integral = None
+            total_beam_integral = None
+            tpx3_beam_integrals = []
+            relative_beam_factor = 1.0
             factor = 1.0
             applied = False
             if intensity_enabled and group:
@@ -1848,8 +2174,15 @@ def _correction_plan(
                     group,
                     context=f"experiment:{layout['experiment']}:{run['name']}",
                 )
-                beam_integral = mean_beam_integral_for_windows(beamhistory, group)
-                factor = beam_integral / float(reference_value)
+                beam_metrics = beam_metrics_for_windows(beamhistory, group)
+                beam_integral = beam_metrics["beam_integral_per_minute"]
+                total_beam_integral = beam_metrics["total_beam_integral"]
+                tpx3_beam_integrals = beam_metrics["tpx3_beam_integrals"]
+                relative_beam_factor = beam_integral / float(reference_value)
+                factor = (
+                    relative_beam_factor
+                    * provenance["effective_exposure_fraction"]
+                )
                 applied = True
 
             base, ext = os.path.splitext(fname)
@@ -1867,13 +2200,31 @@ def _correction_plan(
                     "corrected_filename": dst_name,
                     "time": acquisition_time,
                     "beam_integral": beam_integral,
+                    "beam_integral_per_minute": beam_integral,
+                    "total_beam_integral": total_beam_integral,
+                    "tpx3_beam_integrals_json": json.dumps(
+                        tpx3_beam_integrals, separators=(",", ":")
+                    ),
+                    "relative_beam_factor": float(relative_beam_factor),
                     "relative_factor": float(factor),
                     "intensity_correction_applied": applied,
-                    "tpx_file_count": tpx_file_count,
+                    "tpx_file_count": provenance["tpx_file_count"],
+                    "input_tpx_file_count": provenance["input_tpx_file_count"],
+                    "excluded_tpx_file_count": provenance["excluded_tpx_file_count"],
+                    "excluded_tpx_files": ";".join(provenance["excluded_tpx_files"]),
+                    "processing_exclusions_path": provenance["processing_exclusions_path"],
                     "exposure_window_count": len(group),
-                    "total_effective_exposure_s": float(sum(window["duration_s"] for window in group)),
+                    "total_effective_exposure_s": provenance[
+                        "included_effective_exposure_s"
+                    ],
+                    "nominal_effective_exposure_s": provenance[
+                        "nominal_effective_exposure_s"
+                    ],
+                    "effective_exposure_fraction": provenance[
+                        "effective_exposure_fraction"
+                    ],
                     "exposure_timing_source": timing_source,
-                    "timing_metadata_paths": metadata_paths,
+                    "timing_metadata_paths": provenance["timing_metadata_paths"],
                 }
             )
     return layout, rows, intensity_enabled
@@ -2439,6 +2790,9 @@ def run_operando_pipeline(
             final_subfolder=reference_final_subfolder,
             dtype=compute_dtype,
             file_filter=file_filter,
+            beamhistory_path=reference_beamhistory_path,
+            reference_beam_integral_per_minute=reference_beam_integral_per_minute,
+            tpx_time=tpx_time,
         )
         if len(ref_series) == 0:
             raise ValueError(

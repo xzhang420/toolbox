@@ -312,6 +312,14 @@ def _discover_canonical(
         for name in run_names
     )
     experiment_manifest = _read_json_object(layout_root / "metadata" / experiment / "experiment.json")
+    excluded_runs = set()
+    for run in runs:
+        if (run.metadata_dir / "processing_exclusions.json").is_file():
+            from . import backends
+
+            if backends.nci_data().load_run_processing_exclusion(run.metadata_dir) is not None:
+                excluded_runs.add(run.name)
+    products = _canonical_products(layout_root, experiment, run_names)
     return Dataset(
         input_path=requested,
         layout_type="v2",
@@ -319,10 +327,10 @@ def _discover_canonical(
         proposal_root=layout_root.parent.parent if layout_root.parent.name == "data" else layout_root.parent,
         layout_root=layout_root,
         runs=runs,
-        products=tuple(_canonical_products(layout_root, experiment, run_names)),
+        products=tuple(product for product in products if product.run not in excluded_runs),
         selected_variant=variant or selected_variant,
         selected_run=selected_run,
-        metadata={"experiment_manifest": experiment_manifest},
+        metadata={"experiment_manifest": experiment_manifest, "excluded_runs": sorted(excluded_runs)},
     )
 
 

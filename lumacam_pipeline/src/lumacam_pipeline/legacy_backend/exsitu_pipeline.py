@@ -16,6 +16,7 @@ the file discovery is more permissive for ex-situ sample folders.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import warnings
 from dataclasses import dataclass
@@ -140,9 +141,10 @@ def discover_exsitu_images(data_dir, final_subfolder="final", file_filter=None):
 
     records = []
     used_names = set()
+    is_v2 = operando_data._find_v2_layout_root(str(data_path)) is not None
 
     flat_files = _tiff_files(data_path, file_filter=file_filter)
-    if flat_files:
+    if flat_files and not is_v2:
         tpx_folder = data_path / "tpx3Files"
         tpx_folder = tpx_folder if tpx_folder.is_dir() else None
         metadata_dir = data_path / "metadata"
@@ -167,6 +169,9 @@ def discover_exsitu_images(data_dir, final_subfolder="final", file_filter=None):
             final_subfolder=final_subfolder,
         )
     except ValueError:
+        if is_v2:
+            # A v2 metadata error must not silently fall back to stale TIFFs.
+            raise
         layout = None
     if layout is not None:
         for run in layout["runs"]:
@@ -203,6 +208,8 @@ def discover_exsitu_images(data_dir, final_subfolder="final", file_filter=None):
                 )
         if records:
             return records
+        if is_v2:
+            raise ValueError(f"No non-excluded matching TIFF images found in {data_path}")
 
     for child in sorted(data_path.iterdir(), key=lambda p: p.name):
         if not child.is_dir() or child.name in {"results", "tpx3Files", "__pycache__"}:
@@ -329,6 +336,7 @@ def _compute_intensity_factors(
     tpx_groups = _group_tpx_by_image(records, n_tpx_per_image, tpx_time=tpx_time)
     beam_rows = []
     integrals_by_path = {}
+    beam_metrics_by_path = {}
     times_by_path = {}
     windows_by_path = {}
 
@@ -352,9 +360,11 @@ def _compute_intensity_factors(
             group,
             context=f"exsitu:{record.group_label}:{record.path.name}",
         )
-        integral = operando_data.mean_beam_integral_for_windows(beamhistory, group)
+        beam_metrics = operando_data.beam_metrics_for_windows(beamhistory, group)
+        integral = beam_metrics["beam_integral_per_minute"]
         acq_time = operando_data.mean_exposure_midpoint(group)
         integrals_by_path[record.path] = integral
+        beam_metrics_by_path[record.path] = beam_metrics
         times_by_path[record.path] = acq_time
 
     valid_integrals = [value for value in integrals_by_path.values() if np.isfinite(value)]
@@ -378,10 +388,19 @@ def _compute_intensity_factors(
                 record.tpx_folder, record.metadata_dir, tpx_time=tpx_time
             )
         else:
-            factor = float(integral) / float(reference_integral)
+            relative_beam_factor = float(integral) / float(reference_integral)
             acq_time = times_by_path.get(record.path)
-        factors[record.path] = factor
         record_windows = windows_by_path.get(record.path, [])
+        provenance = operando_data.exposure_group_provenance(record_windows)
+        if integral is None:
+            relative_beam_factor = 1.0
+            factor = 1.0
+        else:
+            factor = (
+                relative_beam_factor * provenance["effective_exposure_fraction"]
+            )
+        factors[record.path] = factor
+        beam_metrics = beam_metrics_by_path.get(record.path, {})
         beam_rows.append(
             {
                 "group": record.group_label,
@@ -390,10 +409,29 @@ def _compute_intensity_factors(
                 "corrected_filename": record.output_name,
                 "time": acq_time,
                 "beam_integral": integral,
-                "relative_factor": factor,
-                "total_effective_exposure_s": float(
-                    sum(window["duration_s"] for window in record_windows)
+                "beam_integral_per_minute": integral,
+                "total_beam_integral": beam_metrics.get("total_beam_integral"),
+                "tpx3_beam_integrals_json": json.dumps(
+                    beam_metrics.get("tpx3_beam_integrals", []),
+                    separators=(",", ":"),
                 ),
+                "relative_beam_factor": relative_beam_factor,
+                "relative_factor": factor,
+                "tpx_file_count": provenance["tpx_file_count"],
+                "input_tpx_file_count": provenance["input_tpx_file_count"],
+                "excluded_tpx_file_count": provenance["excluded_tpx_file_count"],
+                "excluded_tpx_files": ";".join(provenance["excluded_tpx_files"]),
+                "processing_exclusions_path": provenance["processing_exclusions_path"],
+                "timing_metadata_paths": provenance["timing_metadata_paths"],
+                "total_effective_exposure_s": provenance[
+                    "included_effective_exposure_s"
+                ],
+                "nominal_effective_exposure_s": provenance[
+                    "nominal_effective_exposure_s"
+                ],
+                "effective_exposure_fraction": provenance[
+                    "effective_exposure_fraction"
+                ],
                 "exposure_timing_source": (
                     "manifest"
                     if record_windows and record_windows[0].get("manifest_path")

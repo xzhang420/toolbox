@@ -510,6 +510,22 @@ def _prepare_shared_reference(proposal_root, config, log_path):
     reference = Path(reference_value).expanduser().resolve()
     variant = str(corrections.get("file_filter") or config.get("project", {}).get("variant", ""))
     source_files = _reference_source_files(reference, variant)
+    # Exclusions/timing can change without any TIFF changing. Include the
+    # sidecars in the cache key so excluded reference counts cannot be reused.
+    reference_metadata = []
+    if reference.is_dir():
+        layout = backends.nci_data().resolve_nci_experiment(
+            str(reference),
+            final_subfolder=str(corrections.get("reference_final_subfolder", "final")),
+        )
+        for run in layout["runs"]:
+            if run.get("metadata_dir"):
+                reference_metadata.extend(Path(run["metadata_dir"]).glob("*.json"))
+        if layout.get("layout_type") == "v2":
+            for run_name in layout.get("excluded_runs", []):
+                reference_metadata.extend(
+                    (Path(layout["layout_root"]) / "metadata" / layout["experiment"] / run_name).glob("*.json")
+                )
     signature = _path_signature(source_files)
     settings = {
         "reference": str(reference),
@@ -517,8 +533,22 @@ def _prepare_shared_reference(proposal_root, config, log_path):
         "reference_bin_y": int(corrections.get("reference_bin_y", 2)),
         "reference_bin_x": int(corrections.get("reference_bin_x", 2)),
         "reference_final_subfolder": str(corrections.get("reference_final_subfolder", "final")),
+        "reference_beamhistory_path": str(
+            corrections.get("reference_beamhistory_path", "") or ""
+        ),
+        "reference_beam_integral_per_minute": corrections.get(
+            "reference_beam_integral_per_minute"
+        ),
+        "tpx_time": float(corrections.get("tpx_time", 2)),
         "source_signature": signature,
+        "metadata_signature": _path_signature(reference_metadata),
     }
+    reference_beam_path = Path(settings["reference_beamhistory_path"]).expanduser()
+    settings["reference_beamhistory_signature"] = (
+        _path_signature([reference_beam_path])
+        if settings["reference_beamhistory_path"] and reference_beam_path.is_file()
+        else []
+    )
     cache_key = _digest(settings)[:16]
     cache_dir = proposal_root / "analysis" / "proposal_summary" / "reference_cache" / cache_key
     safe_variant = re.sub(r"[^A-Za-z0-9._-]+", "_", variant).strip("._-") or "default"
@@ -537,6 +567,11 @@ def _prepare_shared_reference(proposal_root, config, log_path):
             final_subfolder=settings["reference_final_subfolder"],
             dtype=np.float32,
             file_filter=variant or None,
+            beamhistory_path=settings["reference_beamhistory_path"] or None,
+            reference_beam_integral_per_minute=settings[
+                "reference_beam_integral_per_minute"
+            ],
+            tpx_time=settings["tpx_time"],
         )
     if not series:
         raise ValueError(f"No reference TIFF images found for variant {variant!r}: {reference}")
@@ -637,8 +672,8 @@ def run_batch(
         handle.write(f"{_now()} starting/resuming batch {safe_name}\n")
 
     if "corrections" in report.sections:
-        _prepare_shared_reference(report.proposal_root, base_config, log_path)
         _prepare_reference_integral(base_config, log_path)
+        _prepare_shared_reference(report.proposal_root, base_config, log_path)
     recipe_hash = _digest(
         {"preset": preset, "config": base_config, "sections": report.sections}
     )

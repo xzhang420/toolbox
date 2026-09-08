@@ -33,6 +33,24 @@ Beam-history loading accepts legacy AM/PM timestamps, the newer
 nanosecond resolution. Sampling cadence is inferred automatically and long
 timestamp gaps are reported before correction.
 
+For version-2 data, beam integrals are calculated from the exposure-manifest
+windows that actually contributed to each reconstructed TIFF. If upstream
+reduction recorded a preserved failed tail in `processing_exclusions.json`,
+that interval is omitted from the beam integral as well as from the image. The
+correction factor combines the included interval's average beam level with its
+fraction of the run's planned effective exposure, so a shortened TIFF is also
+normalized for its actual beam dose. The beam log records total beam integral,
+per-TPX3 integrals, included/input/excluded counts, excluded filenames, and both
+metadata paths. Inconsistent exclusion metadata stops correction instead of
+silently using a mismatched interval.
+
+When reference/OB beam history is supplied, reference TIFFs receive the same
+beam-dose and effective-exposure normalization before spatial processing and
+averaging. Batch reference caches include the reference beam-history signature
+and exclusion/timing metadata so changed inputs cannot silently reuse an older
+normalization. Whole-run exclusions apply to normal image loading, ex-situ
+discovery and reference processing, including when old TIFFs remain on disk.
+
 Experiment-wide `_sumAllRuns.tiff` products are discovered as aggregate
 products and excluded from time-series processing by default. They can be
 included explicitly in the project section for overview work.

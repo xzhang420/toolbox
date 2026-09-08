@@ -16,7 +16,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SOURCE_ROOT))
 
-from lumacam_pipeline import backends
+from lumacam_pipeline import backends, discover_dataset
+from lumacam_pipeline.batch import _prepare_shared_reference
 
 
 operando_data = backends.nci_data()
@@ -83,6 +84,74 @@ def write_exposure_manifest(layout_root, experiment, run_name, base_timestamp):
     (metadata_dir / "tpx3_exposure_manifest.json").write_text(
         json.dumps(payload), encoding="utf-8"
     )
+
+
+def write_processing_exclusion(layout_root, experiment, run_name, frame_index=2):
+    metadata_dir = layout_root / "metadata" / experiment / run_name
+    manifest_path = metadata_dir / "tpx3_exposure_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    frame = dict(manifest["frames"][frame_index])
+    frame.update(
+        {
+            "reason": "missing_global_timestamp",
+            "converter_message": "Supplied file does not contain a global timestamp!",
+            "raw_tpx3_retained": True,
+        }
+    )
+    input_duration = float(manifest["summary"]["total_effective_exposure_s"])
+    excluded_duration = float(frame["duration_s"])
+    payload = {
+        "schema": "lumacam-processing-exclusions",
+        "schema_version": 1,
+        "experiment": experiment,
+        "run": run_name,
+        "policy": "manifest-proven-final-partial-missing-global-timestamp-only",
+        "source_exposure_manifest": str(manifest_path),
+        "raw_tpx3_retained": True,
+        "input_frame_count": len(manifest["frames"]),
+        "processed_frame_count": len(manifest["frames"]) - 1,
+        "excluded_frame_count": 1,
+        "input_effective_exposure_s": input_duration,
+        "excluded_effective_exposure_s": excluded_duration,
+        "included_effective_exposure_s": input_duration - excluded_duration,
+        "excluded_frames": [frame],
+    }
+    path = metadata_dir / "processing_exclusions.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def write_run_processing_exclusion(layout_root, experiment, run_name):
+    metadata_dir = layout_root / "metadata" / experiment / run_name
+    manifest_path = metadata_dir / "tpx3_exposure_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    frames = []
+    for source in manifest["frames"]:
+        frame = dict(source)
+        frame.update({"reason": "manual_run_exclusion", "raw_tpx3_retained": True})
+        frames.append(frame)
+    input_duration = float(manifest["summary"]["total_effective_exposure_s"])
+    payload = {
+        "schema": "lumacam-processing-exclusions",
+        "schema_version": 1,
+        "experiment": experiment,
+        "run": run_name,
+        "run_excluded": True,
+        "run_exclusion_reason": "manual_run_exclusion",
+        "policy": "operator-specified-whole-run-exclusion",
+        "source_exposure_manifest": str(manifest_path),
+        "raw_tpx3_retained": True,
+        "input_frame_count": len(frames),
+        "processed_frame_count": 0,
+        "excluded_frame_count": len(frames),
+        "input_effective_exposure_s": input_duration,
+        "excluded_effective_exposure_s": input_duration,
+        "included_effective_exposure_s": 0.0,
+        "excluded_frames": frames,
+    }
+    path = metadata_dir / "processing_exclusions.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
 def write_constant_beam_history(path, base_timestamp, value=100.0):
@@ -196,6 +265,71 @@ class BeamHistoryParsingTests(unittest.TestCase):
 
 
 class NciLayoutCompatibilityTests(unittest.TestCase):
+
+    def test_v2_resolver_omits_whole_run_processing_exclusion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs = ["sample_00006", "sample_00007", "sample_00008"]
+            layout_root = make_v2_experiment(root, "sample", runs)
+            for index, run in enumerate(runs):
+                write_exposure_manifest(
+                    layout_root, "sample", run, 1_700_000_000 + index * 60
+                )
+            write_run_processing_exclusion(layout_root, "sample", runs[1])
+
+            layout = operando_data.resolve_nci_experiment(
+                layout_root / "final" / "sample"
+            )
+
+            self.assertEqual(
+                [run["name"] for run in layout["runs"]], [runs[0], runs[2]]
+            )
+            self.assertEqual(layout["excluded_runs"], [runs[1]])
+
+            dataset = discover_dataset(layout_root / "final" / "sample")
+            self.assertEqual({product.run for product in dataset.image_products()}, {runs[0], runs[2]})
+            self.assertEqual(dataset.metadata["excluded_runs"], [runs[1]])
+            self.assertEqual(
+                {record.group_label for record in discover_exsitu_images(layout_root / "final" / "sample")},
+                {runs[0], runs[2]},
+            )
+
+    def test_exsitu_cannot_bypass_exclusions_with_flat_variant_or_empty_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = "sample_00007"
+            layout_root = make_v2_experiment(root, "sample", [run])
+            write_exposure_manifest(layout_root, "sample", run, 1_700_000_000)
+            exclusion_path = write_run_processing_exclusion(layout_root, "sample", run)
+            final_root = layout_root / "final" / "sample"
+            variant_dir = final_root / "3to1000"
+            variant_dir.mkdir()
+            tifffile.imwrite(variant_dir / f"{run}_sumImage_3to1000.tiff", np.ones((4, 4)))
+            for directory in (final_root, variant_dir):
+                with self.assertRaisesRegex(ValueError, "No non-excluded"):
+                    discover_exsitu_images(directory)
+            exclusion_path.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "processing-exclusion schema"):
+                discover_exsitu_images(variant_dir)
+
+    def test_reference_cache_changes_when_a_run_is_excluded_without_tiff_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs = ["reference_00000", "reference_00001"]
+            layout_root = make_v2_experiment(root, "reference", runs, image_value=10.0)
+            for index, run in enumerate(runs):
+                write_exposure_manifest(layout_root, "reference", run, 1_700_000_000 + index * 60)
+            config = {"corrections": {
+                "reference_dir": str(layout_root / "final" / "reference"),
+                "file_filter": "3to1000", "reference_bin_y": 1, "reference_bin_x": 1,
+            }}
+            before = _prepare_shared_reference(root, config, root / "batch.log")
+            self.assertAlmostEqual(float(tifffile.imread(before).mean()), 10.5)
+            write_run_processing_exclusion(layout_root, "reference", runs[1])
+            after = _prepare_shared_reference(root, config, root / "batch.log")
+            self.assertNotEqual(before, after)
+            self.assertAlmostEqual(float(tifffile.imread(after).mean()), 10.0)
+
     def test_manifest_windows_weight_short_final_frame_by_its_actual_duration(self):
         base = datetime(2025, 1, 1, 12, 0, 0)
         beamhistory = operando_data.pd.DataFrame(
@@ -224,6 +358,68 @@ class NciLayoutCompatibilityTests(unittest.TestCase):
         ]
         value = operando_data.mean_beam_integral_for_windows(beamhistory, windows)
         self.assertAlmostEqual(value, (6000.0 * 2.0 + 12000.0 * 0.25) / 2.25)
+
+    def test_processing_exclusion_removes_tail_from_beam_integral(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_name = "sample_00000"
+            layout_root = make_v2_experiment(root, "sample", [run_name])
+            base_timestamp = 1_700_000_000
+            write_exposure_manifest(layout_root, "sample", run_name, base_timestamp)
+            exclusions_path = write_processing_exclusion(
+                layout_root, "sample", run_name
+            )
+            metadata_dir = layout_root / "metadata" / "sample" / run_name
+            windows = operando_data.get_exposure_windows(metadata_dir=metadata_dir)
+            beam = operando_data.pd.DataFrame(
+                {
+                    "timestamp": [
+                        datetime.fromtimestamp(base_timestamp - 1),
+                        datetime.fromtimestamp(base_timestamp + 4),
+                        datetime.fromtimestamp(base_timestamp + 5),
+                    ],
+                    "beam_count": [100.0, 1000.0, 1000.0],
+                }
+            )
+
+            self.assertEqual([window["file_name"] for window in windows], [
+                "raw_000.tpx3", "raw_001.tpx3"
+            ])
+            self.assertAlmostEqual(
+                operando_data.mean_beam_integral_for_windows(beam, windows),
+                6000.0,
+            )
+            beam_metrics = operando_data.beam_metrics_for_windows(beam, windows)
+            self.assertAlmostEqual(beam_metrics["total_beam_integral"], 400.0)
+            self.assertEqual(len(beam_metrics["tpx3_beam_integrals"]), 2)
+            self.assertAlmostEqual(
+                beam_metrics["tpx3_beam_integrals"][0]["total_beam_integral"],
+                200.0,
+            )
+            provenance = operando_data.exposure_group_provenance(windows)
+            self.assertEqual(provenance["tpx_file_count"], 2)
+            self.assertEqual(provenance["input_tpx_file_count"], 3)
+            self.assertEqual(provenance["excluded_tpx_file_count"], 1)
+            self.assertEqual(provenance["excluded_tpx_files"], ["raw_002.tpx3"])
+            self.assertEqual(provenance["processing_exclusions_path"], str(exclusions_path))
+
+    def test_processing_exclusion_must_match_exposure_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_name = "sample_00000"
+            layout_root = make_v2_experiment(root, "sample", [run_name])
+            write_exposure_manifest(layout_root, "sample", run_name, 1_700_000_000)
+            exclusions_path = write_processing_exclusion(
+                layout_root, "sample", run_name
+            )
+            exclusions = json.loads(exclusions_path.read_text(encoding="utf-8"))
+            exclusions["excluded_frames"][0]["file_name"] = "unknown.tpx3"
+            exclusions_path.write_text(json.dumps(exclusions), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "absent from the exposure manifest"):
+                operando_data.get_exposure_windows(
+                    metadata_dir=layout_root / "metadata" / "sample" / run_name
+                )
 
     def test_v2_resolver_pairs_separate_raw_and_final_trees(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -274,6 +470,9 @@ class NciLayoutCompatibilityTests(unittest.TestCase):
             layout_root = make_v2_experiment(root, "sample", [run_name])
             base_timestamp = 1_700_000_000
             write_exposure_manifest(layout_root, "sample", run_name, base_timestamp)
+            exclusions_path = write_processing_exclusion(
+                layout_root, "sample", run_name
+            )
             shutil.rmtree(layout_root / "tpx3Files" / "sample" / run_name)
             beam_path = root / "beam.csv"
             write_constant_beam_history(beam_path, base_timestamp)
@@ -288,8 +487,33 @@ class NciLayoutCompatibilityTests(unittest.TestCase):
             )
             self.assertTrue(result["intensity_corrected"])
             self.assertEqual(result["beam_log"][0]["exposure_timing_source"], "manifest")
-            self.assertAlmostEqual(result["beam_log"][0]["total_effective_exposure_s"], 4.25)
-            self.assertEqual(result["beam_log"][0]["tpx_file_count"], 3)
+            self.assertAlmostEqual(result["beam_log"][0]["total_effective_exposure_s"], 4.0)
+            self.assertEqual(result["beam_log"][0]["tpx_file_count"], 2)
+            self.assertEqual(result["beam_log"][0]["input_tpx_file_count"], 3)
+            self.assertEqual(result["beam_log"][0]["excluded_tpx_file_count"], 1)
+            self.assertEqual(result["beam_log"][0]["excluded_tpx_files"], "raw_002.tpx3")
+            self.assertAlmostEqual(result["beam_log"][0]["total_beam_integral"], 400.0)
+            self.assertAlmostEqual(
+                result["beam_log"][0]["effective_exposure_fraction"], 4.0 / 4.25
+            )
+            self.assertAlmostEqual(
+                result["beam_log"][0]["relative_factor"], 4.0 / 4.25
+            )
+            self.assertEqual(
+                len(json.loads(result["beam_log"][0]["tpx3_beam_integrals_json"])),
+                2,
+            )
+            self.assertEqual(
+                result["beam_log"][0]["processing_exclusions_path"],
+                str(exclusions_path),
+            )
+            np.testing.assert_allclose(
+                tifffile.imread(
+                    Path(result["corrected_dir"])
+                    / result["beam_log"][0]["corrected_filename"]
+                ),
+                np.full((4, 4), 10.625),
+            )
 
     def test_operando_accepts_new_five_second_beam_history_format(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -396,6 +620,46 @@ class NciLayoutCompatibilityTests(unittest.TestCase):
             output = next(Path(result["corrected_dir"]).glob("*.tif*"))
             np.testing.assert_allclose(tifffile.imread(output), np.full((4, 4), 5.0))
 
+    def test_reference_image_is_normalized_for_its_excluded_exposure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            layout_root = make_v2_experiment(
+                root, "sample", ["sample_00000"], image_value=10.0
+            )
+            make_v2_experiment(
+                root,
+                "open_beam",
+                ["open_beam_00000"],
+                image_value=2.0 * 4.0 / 4.25,
+            )
+            base_timestamp = 1_700_000_000
+            write_exposure_manifest(
+                layout_root, "sample", "sample_00000", base_timestamp
+            )
+            write_exposure_manifest(
+                layout_root, "open_beam", "open_beam_00000", base_timestamp
+            )
+            write_processing_exclusion(
+                layout_root, "open_beam", "open_beam_00000"
+            )
+            beam_path = root / "beam.csv"
+            write_constant_beam_history(beam_path, base_timestamp)
+
+            result = operando_data.run_operando_pipeline(
+                exp_dir=layout_root / "final" / "sample",
+                beamhistory_path=beam_path,
+                reference_dir=layout_root / "final" / "open_beam",
+                reference_beamhistory_path=beam_path,
+                reference_bin_y=1,
+                reference_bin_x=1,
+                results_dir=root / "results",
+            )
+
+            output = next(Path(result["corrected_dir"]).glob("*.tif*"))
+            np.testing.assert_allclose(
+                tifffile.imread(output), np.full((4, 4), 5.0), rtol=1e-6
+            )
+
 
 class ExSituOptionalCorrectionTests(unittest.TestCase):
     def test_v2_discovery_and_no_optional_inputs(self):
@@ -464,6 +728,7 @@ class ExSituOptionalCorrectionTests(unittest.TestCase):
             layout_root = make_v2_experiment(root, "exsitu", [run_name])
             base_timestamp = 1_700_000_000
             write_exposure_manifest(layout_root, "exsitu", run_name, base_timestamp)
+            write_processing_exclusion(layout_root, "exsitu", run_name)
             shutil.rmtree(layout_root / "tpx3Files" / "exsitu" / run_name)
             beam_path = root / "beam.csv"
             write_constant_beam_history(beam_path, base_timestamp)
@@ -478,7 +743,14 @@ class ExSituOptionalCorrectionTests(unittest.TestCase):
             self.assertTrue(result["intensity_corrected"])
             rows = operando_data.load_obint_beam_log(result["beam_log_path"])
             self.assertEqual(rows[0]["exposure_timing_source"], "manifest")
-            self.assertAlmostEqual(rows[0]["total_effective_exposure_s"], 4.25)
+            self.assertAlmostEqual(rows[0]["total_effective_exposure_s"], 4.0)
+            self.assertEqual(rows[0]["tpx_file_count"], 2)
+            self.assertEqual(rows[0]["input_tpx_file_count"], 3)
+            self.assertEqual(rows[0]["excluded_tpx_file_count"], 1)
+            self.assertEqual(rows[0]["excluded_tpx_files"], "raw_002.tpx3")
+            self.assertAlmostEqual(rows[0]["total_beam_integral"], 400.0)
+            self.assertAlmostEqual(rows[0]["effective_exposure_fraction"], 4.0 / 4.25)
+            self.assertAlmostEqual(rows[0]["relative_factor"], 4.0 / 4.25)
 
 
 class NciOnlyPlotTests(unittest.TestCase):
