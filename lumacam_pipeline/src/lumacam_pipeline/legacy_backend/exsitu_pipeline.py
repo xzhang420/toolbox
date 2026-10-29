@@ -20,6 +20,8 @@ import json
 import sys
 import warnings
 from dataclasses import dataclass
+from ..proposal_paths import analysis_root_for_proposal, proposal_root_for_layout
+
 from pathlib import Path
 
 import numpy as np
@@ -70,8 +72,8 @@ def _default_results_path(data_dir):
     try:
         layout = operando_data.resolve_nci_experiment(str(data_path))
         if layout["layout_type"] == "v2":
-            proposal_root = Path(layout["layout_root"]).parents[1]
-            return proposal_root / "analysis" / layout["experiment"]
+            proposal_root = proposal_root_for_layout(layout["layout_root"])
+            return analysis_root_for_proposal(proposal_root) / layout["experiment"]
     except ValueError:
         pass
     return data_path.parent / "analysis" / data_path.name
@@ -79,7 +81,7 @@ def _default_results_path(data_dir):
 
 def _is_tiff(path):
     try:
-        return path.is_file() and operando_data.is_tiff_file(str(path))
+        return path.is_file() and operando_data.is_tiff_file(str(path)) and not operando_data.is_all_runs_sum(path)
     except Exception:
         return False
 
@@ -617,6 +619,8 @@ def run_exsitu_pipeline(
     output_dtype=np.float32,
     verbose=True,
     organized_output=True,
+    output_paths=None,
+    write_average=True,
 ):
     """Run the quick ex-situ image pipeline.
 
@@ -684,6 +688,9 @@ def run_exsitu_pipeline(
         background_input_dir = results_path / "background_corrected_input"
         average_root = results_path
     average_path = average_root / f"{sample_name}.tif"
+    if output_paths:
+        uncorrected_dir = Path(output_paths.get("uncorrected", uncorrected_dir))
+        corrected_dir = Path(output_paths.get("corrected", corrected_dir))
     file_keywords = _normalize_file_keywords(file_filter)
 
     records = discover_exsitu_images(
@@ -836,7 +843,9 @@ def run_exsitu_pipeline(
         print("No BG path supplied; skipped background correction.")
 
     keyword_average_paths = {}
-    if file_keywords:
+    if not write_average:
+        average_path = None
+    elif file_keywords:
         keyword_average_paths = _average_tiffs_by_keyword(
             average_input_paths,
             file_keywords,

@@ -163,6 +163,32 @@ def write_constant_beam_history(path, base_timestamp, value=100.0):
 
 
 class BeamHistoryParsingTests(unittest.TestCase):
+    def test_folder_combines_multiple_beam_history_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "beamhistory"
+            folder.mkdir()
+            (folder / "part_1.dat").write_text(
+                "2026-07-20.12:00:00 100\n"
+                "2026-07-20.12:00:05 110\n"
+                "2026-07-20.12:00:10 120\n",
+                encoding="utf-8",
+            )
+            (folder / "part_2.csv").write_text(
+                "2026-07-20T12:00:10,125\n"
+                "2026-07-20T12:00:15,130\n"
+                "2026-07-20T12:00:20,140\n",
+                encoding="utf-8",
+            )
+
+            with self.assertWarnsRegex(UserWarning, "overlapping timestamp"):
+                beam = operando_data.load_beamhistory(folder, warn_on_gaps=False)
+
+            self.assertEqual(len(beam), 5)
+            np.testing.assert_allclose(beam["beam_count"], [100, 110, 125, 130, 140])
+            self.assertEqual(beam.attrs["beamhistory_cadence"]["source_file_count"], 2)
+            self.assertEqual(beam.attrs["beamhistory_cadence"]["overlapping_row_count"], 1)
+            self.assertEqual(len(beam.attrs["beamhistory_source_files"]), 2)
+
     def test_mixed_human_readable_timestamp_formats_are_accepted(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "beam.csv"
@@ -326,6 +352,9 @@ class NciLayoutCompatibilityTests(unittest.TestCase):
             before = _prepare_shared_reference(root, config, root / "batch.log")
             self.assertAlmostEqual(float(tifffile.imread(before).mean()), 10.5)
             write_run_processing_exclusion(layout_root, "reference", runs[1])
+            with self.assertRaisesRegex(ValueError, "Reference set"):
+                _prepare_shared_reference(root, config, root / "batch.log")
+            config["shared_setup"] = {"reference_set": "excluded_run"}
             after = _prepare_shared_reference(root, config, root / "batch.log")
             self.assertNotEqual(before, after)
             self.assertAlmostEqual(float(tifffile.imread(after).mean()), 10.0)

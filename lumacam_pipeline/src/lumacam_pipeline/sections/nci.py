@@ -45,7 +45,8 @@ class PlatingMetricsSection(PipelineSection):
             )
             rows.append({"image_index": index, "image_time": time, **metrics})
         table = pd.DataFrame(rows)
-        output_dir = Path(session.artifacts.require("results_dir")) / "tables"
+        from .outputs import _category_dir
+        output_dir = _category_dir(session, "tables")
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"plating_metrics_{session.artifacts.require('experiment')}.csv"
         table.to_csv(output_path, index=False)

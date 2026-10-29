@@ -1,13 +1,12 @@
 # LumaCam toolbox
 
-The primary entry point is the section-based
-[LumaCam processing pipeline](lumacam_pipeline/README.md). Start it by opening
-`lumacam_pipeline/lumacam_pipeline.ipynb`.
+The [LumaCam pipeline](lumacam_pipeline/README.md) has two independent notebooks:
+`lumacam_pipeline/lumacam_processing.ipynb` for processing, and
+`lumacam_pipeline/lumacam_visualization.ipynb` for analysis, figures and videos.
 Routine instructions are in the
 [user manual](lumacam_pipeline/user_manual.md).
-It supports operando NCI, NCI image-only, ex-situ, generic image, and
-exact-photon-count hyperspectral workflows without requiring one fixed linear
-sequence.
+Its modes are Operando NCI, Ex situ NCI and Time of flight; optional sections do
+not require one fixed linear sequence.
 
 Obsolete `operando`, `operando_dev`, and `exsitu` entry points have been moved
 to `archive/` for recoverability. Active processing, tests, layout discovery,

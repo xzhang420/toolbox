@@ -5,9 +5,12 @@ import json
 import math
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import tifffile
 import warnings
+from ..products import is_all_runs_sum
+from ..proposal_paths import raw_root_for_layout, proposal_root_for_layout, analysis_root_for_proposal
 
 
 V2_LAYOUT_MARKER = os.path.join("metadata", "layout.json")
@@ -31,45 +34,22 @@ def _find_v2_layout_root(path):
     do not need ``metadata/layout.json``.  The marker remains a read-only
     compatibility signal for older proposals.
     """
-    def is_layout_root(candidate):
-        if os.path.isfile(os.path.join(candidate, V2_LAYOUT_MARKER)):
-            return True
-        basename = os.path.basename(candidate.rstrip(os.sep))
-        parent_name = os.path.basename(os.path.dirname(candidate.rstrip(os.sep)))
-        if basename not in {"experiments", "experiment"} or parent_name != "data":
-            return False
-        has_metadata = os.path.isdir(os.path.join(candidate, "metadata"))
-        has_data_tree = any(
-            os.path.isdir(os.path.join(candidate, name))
-            for name in ("tpx3Files", "final", "derived")
-        )
-        return has_metadata and has_data_tree
-
-    resolved = os.path.abspath(os.path.expanduser(str(path)))
-    current = resolved
-    while True:
-        if is_layout_root(current):
-            return current
-        parent = os.path.dirname(current)
-        if parent == current:
-            break
-        current = parent
-
-    for candidate in (
-        resolved,
-        os.path.join(resolved, "experiments"),
-        os.path.join(resolved, "experiment"),
-        os.path.join(resolved, "data", "experiments"),
-        os.path.join(resolved, "data", "experiment"),
-        os.path.join(resolved, "data"),
-    ):
-        if is_layout_root(candidate):
-            return candidate
-    return None
+    from ..layout import find_layout_root
+    root = find_layout_root(path)
+    return str(root) if root is not None else None
 
 
 def _v2_experiment_name(layout_root, requested_path):
     requested_path = os.path.abspath(requested_path)
+    raw_root = raw_root_for_layout(layout_root)
+    try:
+        raw_parts = Path(requested_path).relative_to(raw_root).parts
+    except ValueError:
+        raw_parts = ()
+    if raw_parts:
+        if len(raw_parts) > 2 or raw_parts[0].startswith("."):
+            raise ValueError("Select a published raw experiment or run")
+        return raw_parts[0], raw_parts[1] if len(raw_parts) == 2 else None, None
     try:
         relative = os.path.relpath(requested_path, layout_root)
     except ValueError:
@@ -82,7 +62,7 @@ def _v2_experiment_name(layout_root, requested_path):
         if len(parts) >= 3 and parts[2] != "summed":
             candidate = parts[2]
             if parts[0] == "final" and not (
-                os.path.isdir(os.path.join(layout_root, "tpx3Files", experiment, candidate))
+                os.path.isdir(str(raw_root_for_layout(layout_root) / experiment / candidate))
                 or os.path.isdir(os.path.join(layout_root, "metadata", experiment, candidate))
             ):
                 selected_variant = candidate
@@ -92,7 +72,7 @@ def _v2_experiment_name(layout_root, requested_path):
 
     experiment_names = set()
     for tree_name in ("final", "tpx3Files"):
-        tree = os.path.join(layout_root, tree_name)
+        tree = str(raw_root_for_layout(layout_root)) if tree_name == "tpx3Files" else os.path.join(layout_root, tree_name)
         if not os.path.isdir(tree):
             continue
         experiment_names.update(
@@ -121,6 +101,13 @@ def resolve_nci_experiment(exp_dir, final_subfolder="final"):
     proposal, ``data/experiments``, ``tpx3Files/<experiment>``,
     ``final/<experiment>``, or one selected run below those trees.
     """
+    if isinstance(exp_dir, dict):
+        # Explicit, already validated product mapping supplied by the processing
+        # adapter. It never changes files or patches the global path resolver.
+        required = {"layout_type", "layout_root", "experiment", "experiment_dir", "runs"}
+        if not required.issubset(exp_dir):
+            raise ValueError("Incomplete normalized experiment mapping")
+        return exp_dir
     requested = os.path.abspath(os.path.expanduser(str(exp_dir)))
     if not os.path.isdir(requested):
         raise ValueError(f"Experiment directory does not exist: {requested}")
@@ -128,7 +115,7 @@ def resolve_nci_experiment(exp_dir, final_subfolder="final"):
     layout_root = _find_v2_layout_root(requested)
     if layout_root is not None:
         experiment, selected_run, selected_variant = _v2_experiment_name(layout_root, requested)
-        tpx3_root = os.path.join(layout_root, "tpx3Files", experiment)
+        tpx3_root = str(raw_root_for_layout(layout_root) / experiment)
         image_root = os.path.join(layout_root, "final", experiment)
         metadata_root = os.path.join(layout_root, "metadata", experiment)
         run_names = set()
@@ -180,7 +167,7 @@ def resolve_nci_experiment(exp_dir, final_subfolder="final"):
                 image_files.extend(
                     entry.path
                     for entry in sorted(os.scandir(old_image_dir), key=lambda item: item.name)
-                    if entry.is_file() and is_tiff_file(entry.path)
+                    if entry.is_file() and is_tiff_file(entry.path) and not is_all_runs_sum(entry.path)
                 )
                 image_dir = old_image_dir
             else:
@@ -190,6 +177,7 @@ def resolve_nci_experiment(exp_dir, final_subfolder="final"):
                         for entry in sorted(os.scandir(variant_dir), key=lambda item: item.name)
                         if entry.is_file()
                         and is_tiff_file(entry.path)
+                        and not is_all_runs_sum(entry.path)
                         and (
                             entry.name == f"{run_name}.tiff"
                             or entry.name == f"{run_name}.tif"
@@ -271,13 +259,13 @@ def list_nci_experiment_dirs(root):
     if layout_root is not None:
         names = set()
         for tree_name in ("final", "tpx3Files"):
-            tree = os.path.join(layout_root, tree_name)
+            tree = str(raw_root_for_layout(layout_root)) if tree_name == "tpx3Files" else os.path.join(layout_root, tree_name)
             if os.path.isdir(tree):
                 names.update(entry.name for entry in os.scandir(tree) if entry.is_dir())
         return [
             os.path.join(layout_root, "final", name)
             if os.path.isdir(os.path.join(layout_root, "final", name))
-            else os.path.join(layout_root, "tpx3Files", name)
+            else str(raw_root_for_layout(layout_root) / name)
             for name in sorted(names)
             if name != "summed" and not name.startswith(".")
         ]
@@ -303,11 +291,17 @@ def _matching_tiff_files(directory, file_filter=None):
         for entry in sorted(os.scandir(directory), key=lambda item: item.name)
         if entry.is_file()
         and is_tiff_file(entry.path)
+        and not is_all_runs_sum(entry.path)
         and (file_filter is None or file_filter in entry.name)
     ]
 
 
 def _run_image_paths(run, file_filter=None):
+    # Normalized processing inputs have already selected an exact variant,
+    # which need not appear in a mapped filename. References still use the
+    # caller's filter; do not globally clear it for preselected samples.
+    if run.get("preselected"):
+        file_filter = None
     explicit = run.get("image_files")
     if explicit is not None:
         return [
@@ -315,6 +309,7 @@ def _run_image_paths(run, file_filter=None):
             for path in explicit
             if os.path.isfile(path)
             and is_tiff_file(path)
+            and not is_all_runs_sum(path)
             and (file_filter is None or file_filter in os.path.basename(path))
         ]
     return [
@@ -346,7 +341,7 @@ timestamp prefix followed by a numeric beam column.
 Parameters
 ----------
 path : str
-    Path to the beam history file.
+    Path to one beam-history file or a folder containing beam-history files.
 
 Returns
 -------
@@ -373,6 +368,8 @@ _BEAMHISTORY_NAIVE_TIMESTAMP_FORMATS = (
     "%d.%m.%Y %H:%M:%S",
     "%Y%m%d%H%M%S",
 )
+
+_BEAMHISTORY_FILE_SUFFIXES = {"", ".csv", ".dat", ".log", ".tsv", ".txt"}
 
 
 def _absolute_times_to_local_naive(values):
@@ -493,9 +490,74 @@ def _warn_beamhistory_quality(beamhistory, path):
 
 
 def load_beamhistory(path, warn_on_gaps=True):
-    """Load flexible beam-history text data and infer its sampling cadence."""
+    """Load one file or combine a folder of flexible beam-history text data."""
+    source = Path(path).expanduser()
+    if source.is_dir():
+        candidates = [
+            candidate
+            for candidate in sorted(source.rglob("*"))
+            if candidate.is_file()
+            and candidate.suffix.lower() in _BEAMHISTORY_FILE_SUFFIXES
+            and not any(part.startswith(".") for part in candidate.relative_to(source).parts)
+        ]
+        if not candidates:
+            raise ValueError(f"No beam-history data files found in folder: {source}")
+
+        frames = []
+        skipped = []
+        for candidate in candidates:
+            try:
+                frames.append(load_beamhistory(candidate, warn_on_gaps=False))
+            except (OSError, UnicodeError, ValueError, pd.errors.ParserError) as exc:
+                skipped.append((candidate, exc))
+        if not frames:
+            details = "; ".join(
+                f"{candidate.name}: {type(exc).__name__}" for candidate, exc in skipped[:5]
+            )
+            raise ValueError(
+                f"No readable beam-history data files found in folder: {source}"
+                + (f" ({details})" if details else "")
+            )
+        if skipped:
+            names = ", ".join(candidate.name for candidate, _ in skipped[:5])
+            suffix = "..." if len(skipped) > 5 else ""
+            warnings.warn(
+                f"Skipped {len(skipped)} unreadable beam-history file(s) in {source}: "
+                f"{names}{suffix}",
+                stacklevel=2,
+            )
+
+        out = pd.concat(frames, ignore_index=True)
+        out = out.sort_values("timestamp", kind="mergesort")
+        overlap_count = int(out.duplicated(subset="timestamp", keep="last").sum())
+        if overlap_count:
+            warnings.warn(
+                f"Combined beam-history folder {source} contains {overlap_count} "
+                "overlapping timestamp row(s); values from later filenames were kept.",
+                stacklevel=2,
+            )
+            out = out.drop_duplicates(subset="timestamp", keep="last")
+        out = out.reset_index(drop=True)
+        cadence = (
+            _warn_beamhistory_quality(out, source)
+            if warn_on_gaps
+            else summarize_beamhistory_cadence(out)
+        )
+        cadence["source_file_count"] = len(frames)
+        cadence["skipped_file_count"] = len(skipped)
+        cadence["overlapping_row_count"] = overlap_count
+        out.attrs["beamhistory_cadence"] = cadence
+        out.attrs["beamhistory_source_files"] = tuple(
+            str(candidate.resolve())
+            for candidate in candidates
+            if candidate not in {item[0] for item in skipped}
+        )
+        return out
+    if not source.is_file():
+        raise ValueError(f"Beam-history path is not a file or folder: {source}")
+
     df = pd.read_csv(
-        path,
+        source,
         header=None,
         engine="python",
         sep=None,
@@ -533,11 +595,12 @@ def load_beamhistory(path, warn_on_gaps=True):
     out = out.dropna(subset=["timestamp"])
     out = out.sort_values("timestamp", kind="mergesort").reset_index(drop=True)
     cadence = (
-        _warn_beamhistory_quality(out, path)
+        _warn_beamhistory_quality(out, source)
         if warn_on_gaps
         else summarize_beamhistory_cadence(out)
     )
     out.attrs["beamhistory_cadence"] = cadence
+    out.attrs["beamhistory_source_files"] = (str(source.resolve()),)
     return out
 
 
@@ -2214,6 +2277,10 @@ def _correction_plan(
                     "excluded_tpx_files": ";".join(provenance["excluded_tpx_files"]),
                     "processing_exclusions_path": provenance["processing_exclusions_path"],
                     "exposure_window_count": len(group),
+                    "exposure_start_utc": min(w['start'] for w in group).astimezone(timezone.utc).isoformat()
+                        if group and timing_source not in {'raw_tpx3_fallback','source_tiff_metadata_or_mtime'} else None,
+                    "exposure_end_utc": max(w['end'] for w in group).astimezone(timezone.utc).isoformat()
+                        if group and timing_source not in {'raw_tpx3_fallback','source_tiff_metadata_or_mtime'} else None,
                     "total_effective_exposure_s": provenance[
                         "included_effective_exposure_s"
                     ],
@@ -2336,8 +2403,8 @@ def collect_and_copy_tiffs(
     if output_dir is None:
         exp_name = layout["experiment"]
         if layout["layout_type"] == "v2":
-            proposal_root = os.path.dirname(os.path.dirname(layout["layout_root"]))
-            results_dir = os.path.join(proposal_root, "analysis", exp_name)
+            proposal_root = proposal_root_for_layout(layout["layout_root"])
+            results_dir = str(analysis_root_for_proposal(proposal_root) / exp_name)
         else:
             parent_dir = os.path.dirname(layout["experiment_dir"])
             results_dir = os.path.join(parent_dir, "analysis", exp_name)
@@ -2725,8 +2792,8 @@ def run_operando_pipeline(
 
     if results_dir is None:
         if layout["layout_type"] == "v2":
-            proposal_root = os.path.dirname(os.path.dirname(layout["layout_root"]))
-            results_dir = os.path.join(proposal_root, "analysis", exp_name)
+            proposal_root = proposal_root_for_layout(layout["layout_root"])
+            results_dir = str(analysis_root_for_proposal(proposal_root) / exp_name)
         else:
             results_dir = os.path.join(parent_dir, "analysis", exp_name)
     os.makedirs(results_dir, exist_ok=True)
@@ -2867,7 +2934,7 @@ def run_operando_pipeline(
         metadata_path,
         stage_name="obint_correction",
         parameters={
-            "exp_dir": os.path.abspath(exp_dir),
+            "exp_dir": os.path.abspath(layout["experiment_dir"]),
             "beamhistory_path": beamhistory_path,
             "output_dir": os.path.abspath(output_dir),
             "uncorrected_dir": os.path.abspath(uncorrected_dir),
@@ -2959,7 +3026,7 @@ def compute_background_image(
     for fname in files:
         path = os.path.join(image_dir, fname)
 
-        if not os.path.isfile(path) or not is_tiff_file(path):
+        if not os.path.isfile(path) or not is_tiff_file(path) or is_all_runs_sum(path):
             continue
 
         # Stop after collecting n_images valid, non-zero TIFFs.
@@ -3132,6 +3199,7 @@ def background_subtract_directory(
         fname for fname in files
         if os.path.isfile(os.path.join(input_dir, fname))
         and is_tiff_file(os.path.join(input_dir, fname))
+        and not is_all_runs_sum(os.path.join(input_dir, fname))
     ]
 
     processed_count = 0

@@ -20,6 +20,10 @@ def _decode(value):
     if not text:
         return ""
     try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        pass
+    try:
         return ast.literal_eval(text)
     except (ValueError, SyntaxError):
         return text
@@ -51,7 +55,7 @@ def save_config(path, preset, values):
                 encoded[name] = ""
             else:
                 encoded[name] = str(value)
-        parser[section] = encoded
+        parser[section] = {key: value.replace("%", "%%") for key, value in encoded.items()}
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w", encoding="utf-8") as handle:

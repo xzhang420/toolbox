@@ -6,14 +6,28 @@ from copy import deepcopy
 
 from .section import PipelineSession
 from .sections import default_sections
+from .white_spots import DEFAULTS as WHITE_SPOT_DEFAULTS
 
 
 COMMON = {
+    "shared_setup": {
+        "reference_set": "",
+        "ob_experiment": "",
+        "background_experiment": "",
+        "reference_source_path": "",
+        "prepared_reference_path": "",
+        "reference_tiff_count": 0,
+        "prepared_background_path": "",
+        "background_source_tiff_count": 0,
+        "background_tiff_count": 0,
+        "metadata_path": "",
+    },
     "project": {
         "data_path": "",
         "experiment": "",
         "variant": "3to1000",
         "result_root": "",
+        "analysis_name": "",
         "product_kinds": "final",
         "include_aggregates": False,
     },
@@ -29,8 +43,9 @@ COMMON = {
         "tpx_time": 2,
         "n_tpx_per_image": 30,
     },
-    "background": {"enabled": False, "background_path": "", "n_images": 7, "clip_negatives": True},
+    "background": {"enabled": False, "source_mode": "auto", "background_path": "", "n_images": 7, "clip_negatives": True},
     "images": {
+        **WHITE_SPOT_DEFAULTS,
         "enabled": True,
         "frames_per_merge": 1,
         "spatial_pixel_merge": 1,
@@ -79,6 +94,8 @@ def _preset(**updates):
 
 
 PRESETS = {
+    # Keep the legacy presets for old configs and Python/CLI callers. The GUI
+    # exposes only the three choices in modes.MODE_OPTIONS.
     "operando_nci": _preset(),
     "nci_images_only": _preset(
         electrochemistry={"enabled": False, "path": ""},
@@ -87,6 +104,7 @@ PRESETS = {
         combined_video={"enabled": False},
     ),
     "exsitu": _preset(
+        average={"collect_in_proposal": True},
         electrochemistry={"enabled": False, "path": ""},
         combined_plot={"enabled": False},
         event_detection={"enabled": False},
@@ -129,4 +147,4 @@ def create_session(name="operando_nci", config=None):
     values = preset_config(name)
     for section, section_values in (config or {}).items():
         values.setdefault(section, {}).update(section_values)
-    return PipelineSession(default_sections(), values)
+    return PipelineSession(default_sections(), values, preset=name)

@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Iterable
 
 from .models import Dataset, ImageProduct, RunRecord
+from .products import final_sum_variant, is_all_runs_sum
+from .proposal_paths import proposal_root_for_layout, raw_root_for_layout, split_proposal_root
 
 
 TIFF_SUFFIXES = {".tif", ".tiff"}
@@ -52,6 +54,8 @@ def _candidate_layout_roots(path: Path) -> list[Path]:
             candidates.append(ancestor)
     for base in list(candidates):
         for relative in (
+            Path("reduced/data/experiment"),
+            Path("reduced/data/experiments"),
             Path("data/experiments"),
             Path("data/experiment"),
             Path("experiments"),
@@ -69,6 +73,16 @@ def find_layout_root(path: str | Path) -> Path | None:
     resolved = _resolved(path)
     structural = [candidate for candidate in _candidate_layout_roots(resolved) if _is_structural_layout_root(candidate)]
     if structural:
+        root = structural[0]
+        outer = proposal_root_for_layout(root)
+        named = [outer / relative for relative in (
+            "data/experiment", "data/experiments", "reduced/data/experiment", "reduced/data/experiments")]
+        if sum(path.exists() or path.is_symlink() for path in named) > 1:
+            raise LayoutError(f"Multiple layout roots found below: {outer}")
+        if split_proposal_root(root) is not None and any((root / name).exists() for name in ("tpx3Files", "raw")):
+            raise LayoutError(f"Mixed raw/reduced and nested raw layout: {outer}")
+        if split_proposal_root(root) is None and (outer / "raw").exists():
+            raise LayoutError(f"Multiple raw layout roots found below: {outer}")
         return structural[0]
     marked = [candidate for candidate in _candidate_layout_roots(resolved) if (candidate / LAYOUT_MARKER).is_file()]
     return marked[0] if marked else None
@@ -78,7 +92,7 @@ def list_experiments(layout_root: str | Path) -> list[str]:
     root = _resolved(layout_root)
     names: set[str] = set()
     for tree_name in ("metadata", "tpx3Files", "final", "derived"):
-        tree = root / tree_name
+        tree = raw_root_for_layout(root) if tree_name == "tpx3Files" else root / tree_name
         if not tree.is_dir():
             continue
         names.update(
@@ -143,6 +157,15 @@ def resolve_experiment_name(requested: str, available: Iterable[str]) -> str:
 
 
 def _selection_from_path(layout_root: Path, requested: Path) -> tuple[str | None, str | None, str | None]:
+    if split_proposal_root(layout_root) is not None:
+        try:
+            raw_parts = requested.relative_to(raw_root_for_layout(layout_root)).parts
+        except ValueError:
+            raw_parts = ()
+        if raw_parts:
+            if raw_parts[0].startswith(".") or len(raw_parts) > 2:
+                raise LayoutError("Select a published raw experiment or run")
+            return raw_parts[0], raw_parts[1] if len(raw_parts) == 2 else None, None
     try:
         relative = requested.relative_to(layout_root)
     except ValueError:
@@ -215,7 +238,7 @@ def _run_names(layout_root: Path, experiment: str) -> list[str]:
     manifest = _read_json_object(layout_root / "metadata" / experiment / "experiment.json")
     names.update(str(name) for name in manifest.get("expected_runs", []) if str(name).strip())
     for tree_name in ("tpx3Files", "metadata", "derived"):
-        root = layout_root / tree_name / experiment
+        root = (raw_root_for_layout(layout_root) if tree_name == "tpx3Files" else layout_root / tree_name) / experiment
         if root.is_dir():
             names.update(
                 child.name
@@ -242,9 +265,9 @@ def _canonical_products(layout_root: Path, experiment: str, run_names: list[str]
             else:
                 continue
             for path in files:
-                aggregate = path.resolve(strict=False) in aggregate_outputs or "_sumAllRuns" in path.stem
+                aggregate = path.resolve(strict=False) in aggregate_outputs or is_all_runs_sum(path)
                 run = None if aggregate else _match_run(path.name, run_names)
-                if child.is_dir() and child.name in run_names:
+                if not aggregate and child.is_dir() and child.name in run_names:
                     run = child.name
                 products.append(
                     ImageProduct(
@@ -252,7 +275,7 @@ def _canonical_products(layout_root: Path, experiment: str, run_names: list[str]
                         experiment=experiment,
                         run=run,
                         kind="final",
-                        variant=variant,
+                        variant=(final_sum_variant(path) or variant) if aggregate else variant,
                         aggregate=aggregate,
                         metadata_dir=(metadata_root / run) if run else (metadata_root / "summed"),
                         source_paths=aggregate_sources.get(path.resolve(strict=False), ()),
@@ -264,17 +287,20 @@ def _canonical_products(layout_root: Path, experiment: str, run_names: list[str]
         for path in _tiffs(derived_root, recursive=True):
             relative = path.relative_to(derived_root)
             top = relative.parts[0] if len(relative.parts) > 1 else None
-            aggregate = top == "summed" or "_sumAllRuns" in path.stem
+            aggregate = top == "summed" or is_all_runs_sum(path) or path.resolve(strict=False) in aggregate_outputs
             run = None if aggregate else (top if top in run_names else _match_run(path.name, run_names))
             lower = path.name.lower()
             kind = "derived_photon" if "photon" in lower else "derived_pixel" if "pixel" in lower else "derived"
+            summed_variant = final_sum_variant(path)
+            if aggregate and summed_variant:
+                kind = "final"
             products.append(
                 ImageProduct(
                     path=path,
                     experiment=experiment,
                     run=run,
                     kind=kind,
-                    variant="default",
+                    variant=summed_variant or "default",
                     aggregate=aggregate,
                     metadata_dir=(metadata_root / run) if run else (metadata_root / "summed"),
                     source_paths=aggregate_sources.get(path.resolve(strict=False), ()),
@@ -305,7 +331,7 @@ def _discover_canonical(
     runs = tuple(
         RunRecord(
             name=name,
-            tpx3_dir=layout_root / "tpx3Files" / experiment / name,
+            tpx3_dir=raw_root_for_layout(layout_root) / experiment / name,
             metadata_dir=layout_root / "metadata" / experiment / name,
             derived_dir=layout_root / "derived" / experiment / name,
         )
@@ -324,7 +350,7 @@ def _discover_canonical(
         input_path=requested,
         layout_type="v2",
         experiment=experiment,
-        proposal_root=layout_root.parent.parent if layout_root.parent.name == "data" else layout_root.parent,
+        proposal_root=proposal_root_for_layout(layout_root),
         layout_root=layout_root,
         runs=runs,
         products=tuple(product for product in products if product.run not in excluded_runs),
@@ -345,8 +371,8 @@ def _discover_legacy_or_flat(requested: Path, variant: str | None) -> Dataset:
                 experiment=requested.name,
                 run=None,
                 kind="final",
-                variant=variant or "default",
-                aggregate="_sumAllRuns" in path.stem,
+                variant=final_sum_variant(path) or variant or "default",
+                aggregate=is_all_runs_sum(path),
                 metadata_dir=(requested / "metadata") if (requested / "metadata").is_dir() else None,
             )
             for path in flat_files
@@ -358,7 +384,7 @@ def _discover_legacy_or_flat(requested: Path, variant: str | None) -> Dataset:
         for child in sorted(requested.iterdir())
         if child.is_dir() and ((child / "final").is_dir() or (child / "tpx3Files").is_dir())
     ]
-    if (requested / "final").is_dir() or (requested / "tpx3Files").is_dir():
+    if (requested / "tpx3Files").is_dir() or ((requested / "final").is_dir() and not child_runs):
         child_runs = [requested]
         experiment = requested.parent.name
         experiment_root = requested.parent
@@ -382,13 +408,22 @@ def _discover_legacy_or_flat(requested: Path, variant: str | None) -> Dataset:
                 ImageProduct(
                     path,
                     experiment,
-                    run_path.name,
+                    None if is_all_runs_sum(path) else run_path.name,
                     "final",
-                    variant or "default",
-                    "_sumAllRuns" in path.stem,
+                    final_sum_variant(path) or variant or "default",
+                    is_all_runs_sum(path),
                     metadata_dir if metadata_dir.is_dir() else None,
                 )
             )
+    # Experiment-level legacy sums can live in the historical final folder
+    # or in the new derived/summed folder. They are preview products only.
+    known_paths = {product.path for product in products}
+    for directory in (experiment_root / "final", experiment_root / "derived" / "summed"):
+        for path in _tiffs(directory):
+            if path not in known_paths and is_all_runs_sum(path):
+                products.append(ImageProduct(path, experiment, None, "final",
+                    final_sum_variant(path) or variant or "default", True,
+                    experiment_root / "metadata" / "summed"))
     if not products and not runs:
         raise LayoutError(f"No supported LumaCam, legacy-run, or flat TIFF data found in {requested}")
     return Dataset(

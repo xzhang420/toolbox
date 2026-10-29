@@ -15,6 +15,7 @@ from matplotlib.animation import FFMpegWriter
 import matplotlib.patches as patches
 from bisect import bisect_right
 from matplotlib_scalebar.scalebar import ScaleBar
+from ..products import is_all_runs_sum
 
 
 class ImageArray(np.ndarray):
@@ -383,14 +384,17 @@ def apply_vertical_offsets_to_traces(trace_series, offset_fraction=0.08):
     ]
 
 
-def capacity_from_sign_half_cycles(capacity_series, sign_series):
+def capacity_from_sign_half_cycles(capacity_series, sign_series, *, zero_current=0,
+                                   source_ids=None):
     """
     Convert raw capacity into a continuous half-cycle capacity from a sign series.
 
-    At every sign change, the raw capacity immediately before the sign change
-    is marked as the next half-cycle baseline. Negative-sign points add raw
-    capacity to that baseline; positive-sign points subtract raw capacity from
-    that baseline.
+    Accumulate capacity increments, adding at negative current and subtracting
+    at positive current. Counter resets, polarity changes and independent file
+    boundaries start a new local counter without resetting accumulated charge.
+    Rest holds the accumulated value even if the instrument clears its counter.
+    The result is net transferred charge relative to the beginning of the record,
+    not an absolute inventory of lithium. Negative values are meaningful.
     """
     capacity_series = np.asarray(capacity_series, dtype=float)
     sign_series = np.asarray(sign_series, dtype=float)
@@ -401,34 +405,29 @@ def capacity_from_sign_half_cycles(capacity_series, sign_series):
     if len(capacity_series) == 0:
         return adjusted_capacity
 
-    marked_capacity = 0.0
+    if not np.isfinite(zero_current) or zero_current < 0:
+        raise ValueError("zero_current must be finite and nonnegative.")
+    sources = [None] * len(capacity_series) if source_ids is None else list(source_ids)
+    if len(sources) != len(capacity_series):
+        raise ValueError("source_ids must align with capacity samples.")
+    total = 0.0
     previous_sign = 0.0
     previous_capacity = np.nan
-
+    previous_source = None
     for idx, (capacity, sign_value) in enumerate(zip(capacity_series, sign_series)):
-        current_sign = np.sign(sign_value) if np.isfinite(sign_value) else previous_sign
-        if current_sign == 0:
-            current_sign = previous_sign
-
-        if idx > 0 and current_sign != 0 and previous_sign != 0 and current_sign != previous_sign:
-            if np.isfinite(previous_capacity):
-                marked_capacity = float(previous_capacity)
-
-        if not np.isfinite(capacity):
-            adjusted = np.nan
-        elif current_sign < 0:
-            adjusted = marked_capacity + capacity
-        elif current_sign > 0:
-            adjusted = marked_capacity - capacity
-        else:
-            adjusted = marked_capacity
-
-        adjusted_capacity[idx] = adjusted
-        if np.isfinite(capacity):
-            previous_capacity = float(capacity)
-        if current_sign != 0:
+        if not np.isfinite(capacity) or not np.isfinite(sign_value):
+            continue
+        current_sign = np.sign(sign_value) if abs(sign_value) > zero_current else 0
+        counter = abs(float(capacity))
+        new_counter = (not np.isfinite(previous_capacity) or sources[idx] != previous_source
+                       or (current_sign and previous_sign and current_sign != previous_sign)
+                       or counter < previous_capacity - 1e-10)
+        if current_sign:
+            increment = counter if new_counter else max(0., counter - previous_capacity)
+            total -= current_sign * increment
             previous_sign = current_sign
-
+        adjusted_capacity[idx] = total
+        previous_capacity, previous_source = counter, sources[idx]
     return adjusted_capacity
 
 
@@ -437,9 +436,9 @@ def capacity_from_potential_sign_half_cycles(capacity_series, potential_series):
     return capacity_from_sign_half_cycles(capacity_series, potential_series)
 
 
-def capacity_from_current_sign_half_cycles(capacity_series, current_series):
+def capacity_from_current_sign_half_cycles(capacity_series, current_series, **kwargs):
     """Convert raw capacity using current sign: negative adds, positive subtracts."""
-    return capacity_from_sign_half_cycles(capacity_series, current_series)
+    return capacity_from_sign_half_cycles(capacity_series, current_series, **kwargs)
 
 
 def parse_echem_datetime_value(value):
@@ -724,8 +723,15 @@ def _echem_file_time_range(path, time_column="time/s", probe_rows=20):
 
 
 def _iter_echem_files(root_folder):
-    for root, _, files in os.walk(root_folder):
-        for fname in files:
+    if os.path.isfile(root_folder):
+        if str(root_folder).lower().endswith(ECHEM_EXTENSIONS):
+            yield os.fspath(root_folder)
+        else:
+            raise ValueError(f"Electrochemistry input must be a TXT or CSV file: {root_folder}")
+        return
+    for root, directories, files in os.walk(root_folder):
+        directories.sort()
+        for fname in sorted(files):
             if fname.lower().endswith(ECHEM_EXTENSIONS):
                 yield os.path.join(root, fname)
 
@@ -875,15 +881,18 @@ def load_echem_data(
     window_start=None,
     window_end=None,
     thickness_capacity_mode="current_sign_half_cycle",
+    include_current=False,
+    include_capacity=False,
+    include_provenance=False,
+    zero_current_ma=0.01,
 ):
     """
-    Recursively load electrochemical text files from a folder tree.
+    Load one electrochemical text file or recursively load a folder tree.
 
     By default, the electrochemical thickness series is computed from a
-    current-sign half-cycle capacity. At each current sign change, the raw
-    capacity immediately before the sign change becomes the baseline for the
-    next half-cycle. Negative-current points add raw capacity to that baseline;
-    positive-current points subtract raw capacity from it.
+    continuous net transferred capacity. Counter increments at negative current
+    add charge, positive current subtracts charge and rest holds charge. Local
+    capacity-counter resets never reset the accumulated charge.
     Files without a capacity column can still be loaded for potential-vs-time
     plots; their electrochemical thickness values are returned as NaN.
 
@@ -893,7 +902,7 @@ def load_echem_data(
     Parameters
     ----------
     root_folder : str
-        Root directory containing the electrochemical txt files
+        A TXT/CSV file or directory containing electrochemical text files.
     conv_thickness : float
         Factor used to convert ``Capacity/mA.h`` into electrochemical thickness.
     time_column : str
@@ -953,6 +962,7 @@ def load_echem_data(
             )
             if len(subset) == 0:
                 raise ValueError(f"No data rows in {path}")
+            subset["__source_file"] = os.path.basename(path)
 
             file_datetimes = _echem_datetimes_from_values(subset[time_column])
             if len(file_datetimes) == 0:
@@ -1061,6 +1071,7 @@ def load_echem_data(
     if "<I>/mA" in combined.columns:
         current_series = combined["<I>/mA"].to_numpy(dtype=float)[sorted_idx]
     raw_capacity_series = combined["Capacity/mA.h"].to_numpy(dtype=float)[sorted_idx]
+    source_series = combined["__source_file"].to_numpy()[sorted_idx]
     thickness_capacity_mode = requested_thickness_capacity_mode
     if thickness_capacity_mode in {"raw", "direct"}:
         thickness_capacity_series = raw_capacity_series
@@ -1079,6 +1090,7 @@ def load_echem_data(
             thickness_capacity_series = capacity_from_current_sign_half_cycles(
                 raw_capacity_series,
                 current_series,
+                zero_current=zero_current_ma, source_ids=source_series,
             )
     elif thickness_capacity_mode in {"potential_sign_half_cycle", "sign_half_cycle", "half_cycle"}:
         thickness_capacity_series = capacity_from_potential_sign_half_cycles(
@@ -1161,10 +1173,18 @@ def load_echem_data(
         else:
             print("  Gaps between files: none")
 
+    values = (datetime_series, potential_series, echem_thickness_series)
     if include_cycle:
-        return datetime_series, potential_series, echem_thickness_series, cycle_series
-
-    return datetime_series, potential_series, echem_thickness_series
+        values += (cycle_series,)
+    if include_current:
+        values += (current_series,)
+    if include_capacity:
+        values += (raw_capacity_series,)
+    if include_provenance:
+        values += ({"source_files": source_series, "capacity_mode": thickness_capacity_mode,
+                    "net_capacity_mAh": thickness_capacity_series,
+                    "zero_current_ma": zero_current_ma},)
+    return values
 
 
 
@@ -1404,6 +1424,11 @@ def make_potential_image_video_uniform_time(
     electrode_roi_label="electrode area",
     electrode_roi_color="cyan",
     electrode_roi_linewidth=1.0,
+    limit_to_overlap=False,
+    image_origin="lower",
+    time_window=None,
+    image_gap_minutes=5,
+    image_tolerance_seconds=None,
 ):
     """
     Create a synchronized potential-plus-image video on a uniform time grid.
@@ -1467,10 +1492,27 @@ def make_potential_image_video_uniform_time(
     # ------------------------------------------------------------------
     t_start = min(echem_t.min(), img_t.min())
     t_end = max(echem_t.max(), img_t.max())
+    if limit_to_overlap:
+        t_start = max(echem_t.min(), img_t.min())
+        t_end = min(echem_t.max(), img_t.max())
+        if t_end <= t_start:
+            raise ValueError("Combined video needs a nonzero shared image/electrochemistry time range.")
+    window_indices = np.arange(len(img_t))
+    if time_window is not None:
+        t_start = max(t_start, (time_window[0]-t0).total_seconds())
+        t_end = min(t_end, (time_window[1]-t0).total_seconds())
+        window_indices = np.flatnonzero((img_t >= t_start) & (img_t <= t_end))
+        if t_end <= t_start or not len(window_indices):
+            raise ValueError("Video window needs a nonzero overlap and at least one image frame.")
 
     if dt_seconds is None:
         # sensible default: median image spacing
-        dt_seconds = np.median(np.diff(img_t))
+        positive_steps = np.diff(img_t)
+        positive_steps = positive_steps[positive_steps > 0]
+        dt_seconds = np.median(positive_steps) if positive_steps.size else 1.0
+    dt_seconds = float(dt_seconds)
+    if not np.isfinite(dt_seconds) or dt_seconds <= 0:
+        raise ValueError("Combined video dt_seconds must be positive and finite.")
 
     anim_t = np.arange(t_start, t_end, dt_seconds)
 
@@ -1489,6 +1531,8 @@ def make_potential_image_video_uniform_time(
         return potential_series[i] if i >= 0 else potential_series[0]
 
     def nearest_image_index(t):
+        if time_window is not None:
+            return int(window_indices[np.argmin(abs(img_t[window_indices]-t))])
         i = bisect_right(img_t, t)
         if i == 0:
             return 0
@@ -1544,6 +1588,8 @@ def make_potential_image_video_uniform_time(
     )
 
     ax_v.set_xlabel("Time (h)")
+    if time_window is not None:
+        ax_v.set_xlim(t_start/3600., t_end/3600.)
     ax_v.set_ylabel("Potential (V)")
     ax_v.set_title("Potential evolution")
     if potential_ylim is not None:
@@ -1566,7 +1612,7 @@ def make_potential_image_video_uniform_time(
             t_img_plot, nci_thickness_plot = build_datetime_series_with_pauses(
                 img_datetimes,
                 avg_thickness_series,
-                paused_intervals,
+                find_paused_intervals(img_datetimes,min_gap_minutes=image_gap_minutes),
                 t0,
             )
             thickness_plot_data.append(
@@ -1603,18 +1649,21 @@ def make_potential_image_video_uniform_time(
     for pause_start, pause_end in paused_intervals:
         pause_start_h = (pause_start - t0).total_seconds() / 3600.0
         pause_end_h = (pause_end - t0).total_seconds() / 3600.0
+        if time_window is not None and (pause_end_h < t_start/3600. or pause_start_h > t_end/3600.):
+            continue
         ax_v.axvspan(pause_start_h, pause_end_h, color="tab:red", alpha=0.18)
         ylim = ax_v.get_ylim()
         y_text = ylim[1] - 0.08 * (ylim[1] - ylim[0])
         ax_v.text(
             0.5 * (pause_start_h + pause_end_h),
             y_text,
-            "paused",
+            "EC data gap",
             color="tab:red",
             fontsize=10,
             fontweight="bold",
             ha="center",
             va="top",
+            clip_on=True,
         )
 
     # Get image dimensions for physical extent
@@ -1654,7 +1703,7 @@ def make_potential_image_video_uniform_time(
             image,
             cmap=cmap,
             extent=[x_min, x_max, y_min, y_max],
-            origin="lower",
+            origin=image_origin,
             vmin=vmin,
             vmax=vmax,
         )
@@ -1818,11 +1867,15 @@ def make_potential_image_video_uniform_time(
 
             # Image (nearest)
             j = nearest_image_index(t)
+            unavailable = (image_tolerance_seconds is not None and abs(img_t[j]-t)>float(image_tolerance_seconds))
+            unavailable = unavailable or not np.isfinite(np.asarray(img_series[j])).any()
+            shown = np.full_like(img_series[j],np.nan,dtype=float) if unavailable else img_series[j]
             if render_3d:
-                draw_video_image(img_series[j])
+                draw_video_image(shown)
             else:
-                im.set_data(img_series[j])
-            paused_text.set_visible(is_paused_time(t))
+                im.set_data(shown)
+            paused_text.set_text('Image unavailable' if unavailable else '')
+            paused_text.set_visible(unavailable)
 
             if not render_3d:
                 # Remove previous scale bar rectangles and text
@@ -2025,7 +2078,7 @@ def load_corrected_images_with_time(corrected_dir, tag_id=65002, r0=None, x0=Non
     records = []
     for fname in sorted(os.listdir(corrected_dir)):
         path = os.path.join(corrected_dir, fname)
-        if not os.path.isfile(path):
+        if not os.path.isfile(path) or is_all_runs_sum(path):
             continue
         # Try to open as TIFF (works even if no extension)
         try:
@@ -2934,6 +2987,9 @@ def plot_potential_and_thickness(
     side_text=None,
     side_text_fontsize=8,
     return_axes=False,
+    event_labels=None,
+    current_series=None,
+    image_gap_minutes=None,
 ):
     """
     Plot potential and, optionally, EC and NCI thickness on a common time axis.
@@ -2949,6 +3005,7 @@ def plot_potential_and_thickness(
     img_datetime_series = np.asarray(img_datetime_series)
 
     potential_series = np.asarray(potential_series)
+    current_series = None if current_series is None else np.asarray(current_series)
     selected_thickness_traces = normalize_thickness_traces(thickness_traces, plot_thickness)
     plot_thickness = bool(selected_thickness_traces)
     thickness_layout = str(thickness_layout).strip().lower()
@@ -2975,6 +3032,8 @@ def plot_potential_and_thickness(
         echem_mask = (echem_datetime_series >= t_start) & (echem_datetime_series <= t_end)
         echem_datetime_series = echem_datetime_series[echem_mask]
         potential_series = potential_series[echem_mask]
+        if current_series is not None:
+            current_series = current_series[echem_mask]
         if plot_thickness and "echem" in selected_thickness_traces:
             echem_thickness_series = echem_thickness_series[echem_mask]
     else:
@@ -3018,6 +3077,17 @@ def plot_potential_and_thickness(
                 fontsize=side_text_fontsize,
                 family="monospace",
             )
+        elif current_series is not None:
+            fig = plt.figure(figsize=(8, 7.5))
+            gs = fig.add_gridspec(3, 1, height_ratios=[1, .55, 1], hspace=.12)
+            ax1 = fig.add_subplot(gs[0])
+            ax2 = fig.add_subplot(gs[2], sharex=ax1)
+            ax_current = fig.add_subplot(gs[1], sharex=ax1)
+            x_current, y_current = build_series_with_pauses(t_echem, current_series, paused_intervals, t0)
+            ax_current.plot(x_current, y_current, color='0.35', lw=1)
+            ax_current.axhline(0, color='0.7', lw=.6)
+            ax_current.set_ylabel('Current (mA)')
+            plt.setp(ax_current.get_xticklabels(), visible=False)
         else:
             fig, (ax1, ax2) = plt.subplots(
                 2,
@@ -3091,19 +3161,21 @@ def plot_potential_and_thickness(
         ax1.text(
             0.5 * (pause_start_h + pause_end_h),
             y_text,
-            "paused",
+            "EC data gap",
             color="tab:red",
             fontsize=10,
             fontweight="bold",
             ha="center",
             va="top",
         )
-        if plot_thickness and thickness_layout == "separate":
-            ax2.axvspan(pause_start_h, pause_end_h, color="tab:red", alpha=0.18)
+        if current_series is not None and plot_thickness and thickness_layout == "separate" and not side_text:
+            ax_current.axvspan(pause_start_h, pause_end_h, color="tab:red", alpha=0.10)
 
     # Optional event markers/labels on the potential trace.
     if event_times is not None and len(event_times) > 0:
         for j, raw_time in enumerate(event_times):
+            if raw_time is None:
+                continue
             event_dt = raw_time
             if isinstance(raw_time, str):
                 event_dt = pd.to_datetime(raw_time).to_pydatetime()
@@ -3111,10 +3183,13 @@ def plot_potential_and_thickness(
             dt_seconds = np.array([abs((t - event_dt).total_seconds()) for t in echem_datetime_series])
             idx = int(np.argmin(dt_seconds))
 
-            label = chr(97 + int(label_start) + j)
+            from ..event_selection import panel_label
+            label = event_labels[j] if event_labels is not None else panel_label(int(label_start) + j)
             marker_y = visible_potential_marker_y(potential_series[idx])
             label_offset, label_ha, label_va = potential_label_offset(marker_y)
-            ax1.plot(t_echem[idx], marker_y, "ko", ms=event_marker_size)
+            clipped = potential_series[idx] != marker_y
+            marker = ("^" if potential_series[idx] > marker_y else "v") if clipped else "o"
+            ax1.plot(t_echem[idx], marker_y, color="black", marker=marker, ls="none", ms=event_marker_size)
             ax1.annotate(
                 label,
                 (t_echem[idx], marker_y),
@@ -3143,10 +3218,12 @@ def plot_potential_and_thickness(
                 ("EC thickness", t_echem_thickness_plot, echem_thickness_plot, ec_thickness_color)
             )
         if "nci" in selected_thickness_traces:
+            image_pauses = (find_paused_intervals(img_datetime_series, min_gap_minutes=image_gap_minutes)
+                            if image_gap_minutes is not None else paused_intervals)
             t_img_plot, nci_thickness_plot = build_datetime_series_with_pauses(
                 img_datetime_series,
                 avg_thickness_series,
-                paused_intervals,
+                image_pauses,
                 t0,
             )
             thickness_plot_data.append(

@@ -73,9 +73,9 @@ class TimeOfFlightCubeSection(PipelineSection):
         dominant = np.where(total > 0, dominant, np.nan)
         global_counts = cube.reshape(cube.shape[0], -1).sum(axis=1, dtype=np.float64)
 
-        results_dir = Path(session.artifacts.require("results_dir"))
-        output_root = results_dir / "images" / "tof"
-        table_root = results_dir / "tables" / "tof"
+        from .outputs import _category_dir
+        output_root = _category_dir(session, "images") / "tof"
+        table_root = _category_dir(session, "tables") / "tof"
         output_root.mkdir(parents=True, exist_ok=True)
         table_root.mkdir(parents=True, exist_ok=True)
         feature_arrays = {

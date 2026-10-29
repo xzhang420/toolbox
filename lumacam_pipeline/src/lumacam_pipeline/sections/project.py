@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 from collections import Counter
+from ..proposal_paths import analysis_root_for_proposal, reduced_root_for_proposal
+
 from pathlib import Path
 
 from ..layout import discover_dataset
+from ..result_layout import result_directory
 from ..section import PipelineSection, SectionOutcome, SectionState
 
 
 class ProjectSection(PipelineSection):
     id = "project"
     title = "Project and data"
-    produces = ("dataset", "experiment", "results_dir", "source_products")
+    produces = ("dataset", "experiment", "results_dir", "analysis_root", "source_products", "aggregate_products")
 
     def is_configured(self, config):
         return bool(str(config.get("data_path", "")).strip())
@@ -22,11 +25,8 @@ class ProjectSection(PipelineSection):
             return f"{count} {singular if count == 1 else (plural or singular + 's')}"
 
         requested_experiment = str(config.get("experiment", "")).strip()
-        dataset = discover_dataset(
-            config["data_path"],
-            experiment=requested_experiment or None,
-            variant=str(config.get("variant", "")).strip() or None,
-        )
+        from ..inspection import discover_for_config
+        dataset = discover_for_config(session.config)
         include_aggregates = bool(config.get("include_aggregates", False))
         kinds = config.get("product_kinds", ("final",))
         if isinstance(kinds, str):
@@ -38,8 +38,12 @@ class ProjectSection(PipelineSection):
         )
         per_run_products = [product for product in matching_products if not product.aggregate]
         aggregate_products = [product for product in matching_products if product.aggregate]
-        products = matching_products if include_aggregates else per_run_products
-        if not products:
+        products = per_run_products
+        if session.config.get("workflow", {}).get("role") == "processing":
+            variants = sorted({product.variant for product in products})
+            if len(variants) > 1:
+                raise ValueError(f"Select one image variant before processing: {variants}")
+        if not products and not (include_aggregates and aggregate_products):
             available = sorted({(product.kind, product.variant) for product in dataset.products})
             raise ValueError(
                 "No image products match the selection. "
@@ -49,17 +53,16 @@ class ProjectSection(PipelineSection):
         if raw_result_root:
             result_root = Path(raw_result_root).expanduser()
             if not result_root.is_absolute():
-                base = dataset.proposal_root or dataset.input_path
+                base = reduced_root_for_proposal(dataset.proposal_root) if dataset.proposal_root else dataset.input_path
                 result_root = base / result_root
         elif dataset.proposal_root is not None:
-            result_root = dataset.proposal_root / "analysis"
+            result_root = analysis_root_for_proposal(dataset.proposal_root)
         else:
             result_root = dataset.input_path.parent / "analysis"
         result_root = result_root.resolve(strict=False)
-        results_dir = (
-            result_root
-            if result_root.name == dataset.experiment
-            else result_root / dataset.experiment
+        results_dir = result_directory(
+            result_root, dataset.experiment, config.get("variant", ""),
+            config.get("analysis_name", ""),
         )
         resolved = ""
         if requested_experiment and requested_experiment != dataset.experiment:
@@ -118,7 +121,9 @@ class ProjectSection(PipelineSection):
                 "dataset": dataset,
                 "experiment": dataset.experiment,
                 "results_dir": results_dir,
+                "analysis_root": result_root.parent if result_root.name == dataset.experiment else result_root,
                 "source_products": products,
+                "aggregate_products": aggregate_products if include_aggregates else [],
             },
             {"layout_type": dataset.layout_type},
         )

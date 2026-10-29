@@ -6,6 +6,8 @@ import csv
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
+from .proposal_paths import analysis_root_for_proposal, proposal_root_for_layout
+
 from pathlib import Path
 import re
 from typing import Iterable
@@ -243,7 +245,7 @@ def inspect_metadata_time_ranges(data_path, experiments: Iterable[str] | None = 
         if not selected:
             raise ValueError("Select at least one experiment for metadata time inspection.")
     proposal_root = (
-        layout_root.parent.parent if layout_root.parent.name == "data" else layout_root.parent
+        proposal_root_for_layout(layout_root)
     )
     return ProposalMetadataRange(
         proposal_root=proposal_root.resolve(),
@@ -264,8 +266,7 @@ def save_metadata_time_ranges_csv(report, output_path=None, margin_minutes=5):
     """Save proposal and per-experiment metadata ranges as a portable CSV."""
 
     target = Path(output_path) if output_path else (
-        report.proposal_root
-        / "analysis"
+        analysis_root_for_proposal(report.proposal_root)
         / "proposal_summary"
         / "metadata_datetime_ranges.csv"
     )

@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+from .proposal_paths import analysis_root_for_proposal, proposal_root_for_layout
+
 from pathlib import Path
 import re
 from contextlib import redirect_stderr, redirect_stdout
@@ -18,10 +20,20 @@ import numpy as np
 import tifffile
 
 from . import backends
+from .background import (
+    background_frame_count,
+    background_source as resolve_background_source,
+    effective_background_settings,
+    shared_background_path,
+)
 from .config import save_config
 from .layout import discover_dataset, find_layout_root, list_experiments, resolve_experiment_name
 from .presets import create_session
+from .prepared_inputs import uses_prepared_ob, validate_prepared_ob, prepared_ob_integral
+from .result_layout import average_filename, named_directory, result_directory, shared_directory, snapshot_path
 from .section import SectionState
+from .modes import LEGACY_MODE_ALIASES
+from .white_spots import effective_image_settings, filter_settings
 
 
 BATCH_SECTION_LABELS = {
@@ -120,10 +132,29 @@ class BatchRunSummary:
     status_path: Path
     log_path: Path
     results: tuple[BatchJobResult, ...]
+    report_error: str = ""
 
     @property
     def failed_count(self):
         return sum(result.status == "failed" for result in self.results)
+
+
+@dataclass(frozen=True)
+class SharedPreparationResult:
+    proposal_root: Path
+    ob_experiment: str
+    background_experiment: str
+    reference_source_path: Path
+    prepared_reference_path: Path
+    reference_tiff_count: int
+    reference_beam_integral_per_minute: float | None
+    background_source_path: Path | None
+    corrected_background_dir: Path | None
+    prepared_background_path: Path | None
+    background_source_tiff_count: int
+    background_tiff_count: int
+    metadata_path: Path
+    reused_background_cache: bool
 
 
 def _now():
@@ -187,23 +218,28 @@ def normalize_batch_sections(sections: Iterable[str]):
     return tuple(section for section in BATCH_SECTION_ORDER if section in requested)
 
 
-def _proposal_paths(data_path):
+def _proposal_paths(data_path, config=None):
+    if (config or {}).get("layout", {}).get("images_pattern"):
+        root = Path(data_path).expanduser().resolve()
+        return root, root
     layout_root = find_layout_root(data_path)
     if layout_root is None:
         raise ValueError(f"No supported LumaCam proposal layout found around: {data_path}")
     proposal_root = (
-        layout_root.parent.parent if layout_root.parent.name == "data" else layout_root.parent
+        proposal_root_for_layout(layout_root)
     )
     return proposal_root.resolve(), layout_root.resolve()
 
 
-def discover_batch_experiments(data_path, *, hide_setup=True, filter_text=""):
+def discover_batch_experiments(data_path, *, hide_setup=True, filter_text="", config=None):
     """Return experiment names for an explicit GUI selection list."""
 
-    _, layout_root = _proposal_paths(data_path)
+    _, layout_root = _proposal_paths(data_path, config)
     query = str(filter_text or "").strip().casefold()
     names = []
-    for name in list_experiments(layout_root):
+    from .inspection import mapped_experiments
+    available = mapped_experiments(config) if (config or {}).get("layout", {}).get("images_pattern") else list_experiments(layout_root)
+    for name in available:
         if hide_setup and is_setup_experiment(name):
             continue
         if query and query not in name.casefold():
@@ -238,32 +274,41 @@ def _experiment_override(config, experiment, overrides):
 
 def _common_validation_errors(config, sections, variant, *, check_echem=True):
     errors = []
+    if "images" in sections and config.get("images", {}).get("white_spot_enabled", False):
+        try:
+            filter_settings(config["images"])
+        except ValueError as exc:
+            errors.append(str(exc))
     corrections = config.get("corrections", {})
     if "corrections" in sections:
-        for label, key in (
-            ("Reference/OB", "reference_dir"),
-            ("Beam history", "beamhistory_path"),
-            ("Reference beam history", "reference_beamhistory_path"),
-        ):
+        prepared_mode = uses_prepared_ob(corrections)
+        paths = [("Beam history", "beamhistory_path")]
+        if prepared_mode:
+            prepared = str(corrections.get("prepared_reference_path", "") or "").strip()
+            if prepared:
+                try:
+                    validate_prepared_ob(prepared)
+                except (OSError, ValueError, tifffile.TiffFileError) as exc:
+                    errors.append(str(exc))
+        else:
+            paths.extend((("Reference/OB", "reference_dir"),
+                          ("Reference beam history", "reference_beamhistory_path")))
+        for label, key in paths:
             value = str(corrections.get(key, "") or "").strip()
             if value and not Path(value).expanduser().exists():
                 errors.append(f"{label} path does not exist: {value}")
-        reference = str(corrections.get("reference_dir", "") or "").strip()
+        reference = "" if prepared_mode else str(corrections.get("reference_dir", "") or "").strip()
         if reference:
-            reference_path = Path(reference).expanduser()
-            if reference_path.is_file():
-                candidates = [reference_path]
-            else:
-                candidates = [
-                    path
-                    for path in reference_path.rglob("*")
-                    if path.is_file()
-                    and path.suffix.lower() in {".tif", ".tiff"}
-                    and (not variant or variant in str(path))
-                ]
+            try:
+                candidates = _reference_source_files(reference,
+                    str(corrections.get("file_filter") or variant),
+                    str(corrections.get("reference_final_subfolder", "final")))
+            except (OSError, ValueError) as exc:
+                candidates = []
+                errors.append(f"Reference/OB selection failed: {exc}")
             if not candidates:
                 errors.append(
-                    f"Reference/OB contains no TIFF products for variant {variant!r}: {reference}"
+                    f"Reference/OB contains no individual TIFF products for variant {variant!r}: {reference}"
                 )
     if check_echem and "electrochemistry" in sections:
         value = str(config.get("electrochemistry", {}).get("path", "") or "").strip()
@@ -271,9 +316,16 @@ def _common_validation_errors(config, sections, variant, *, check_echem=True):
             errors.append("Electrochemistry is selected but its path is blank.")
         elif not Path(value).expanduser().exists():
             errors.append(f"Electrochemistry path does not exist: {value}")
-    background = str(config.get("background", {}).get("background_path", "") or "").strip()
-    if "background" in sections and background and not Path(background).expanduser().exists():
-        errors.append(f"Background path does not exist: {background}")
+    if "background" in sections:
+        try:
+            background_config = config.get("background", {})
+            background = shared_background_path(background_config)
+            if background and not Path(background).expanduser().exists():
+                errors.append(f"Background path does not exist: {background}")
+            if not background or not Path(background).expanduser().is_file():
+                background_frame_count(background_config)
+        except ValueError as exc:
+            errors.append(str(exc))
     return tuple(errors)
 
 
@@ -288,12 +340,14 @@ def validate_batch(
 ):
     """Validate selected experiments and shared inputs without creating outputs."""
 
-    proposal_root, layout_root = _proposal_paths(data_path)
+    proposal_root, layout_root = _proposal_paths(data_path, config)
     normalized_sections = normalize_batch_sections(sections)
     base_config = deepcopy(config or {})
     project = base_config.setdefault("project", {})
+    project["data_path"] = str(data_path)
     variant = str(project.get("variant", "") or "").strip()
-    available = list_experiments(layout_root)
+    from .inspection import mapped_experiments, discover_for_config
+    available = mapped_experiments(base_config) if base_config.get("layout", {}).get("images_pattern") else list_experiments(layout_root)
     requested = []
     for experiment in experiments:
         resolved = resolve_experiment_name(experiment, available)
@@ -309,11 +363,15 @@ def validate_batch(
         check_echem=not bool(experiment_overrides),
     )
     reference_shape = None
-    reference_value = str(
-        base_config.get("corrections", {}).get("reference_dir", "") or ""
-    ).strip()
+    reference_settings = base_config.get("corrections", {})
+    reference_value = str(reference_settings.get(
+        "prepared_reference_path" if uses_prepared_ob(reference_settings) else "reference_dir", ""
+    ) or "").strip()
     if "corrections" in normalized_sections and reference_value and not common_errors:
-        reference_files = _reference_source_files(reference_value, variant)
+        reference_settings = base_config.get("corrections", {})
+        reference_files = _reference_source_files(reference_value,
+            str(reference_settings.get("file_filter") or variant),
+            str(reference_settings.get("reference_final_subfolder", "final")))
         if reference_files:
             try:
                 with tifffile.TiffFile(reference_files[0]) as tif:
@@ -340,14 +398,31 @@ def validate_batch(
                     raise ValueError("Electrochemistry is selected but its path is blank.")
                 if not Path(echem_value).expanduser().exists():
                     raise ValueError(f"Electrochemistry path does not exist: {echem_value}")
-            dataset = discover_dataset(data_path, experiment=experiment, variant=row_variant or None)
+            row_config.setdefault("project", {})["data_path"] = str(data_path)
+            dataset = discover_for_config(row_config, experiment=experiment, variant=row_variant or None)
+            if base_config.get("workflow", {}).get("role") == "processing":
+                from .processing import PROCESSING_SECTIONS
+                invalid = set(normalized_sections) - PROCESSING_SECTIONS
+                if invalid:
+                    raise ValueError(f"Analysis/visualization steps do not belong in a processing batch: {sorted(invalid)}")
             products = dataset.image_products(
                 variant=row_variant or None,
                 kinds=_parse_kinds(row_project.get("product_kinds", "final")),
-                include_aggregates=bool(row_project.get("include_aggregates", False)),
+                include_aggregates=False,
             )
             if not products:
                 raise ValueError(f"No matching per-run TIFF products for variant {row_variant!r}.")
+            if row_config.get("workflow", {}).get("role") == "processing":
+                if len({product.variant for product in products}) > 1:
+                    raise ValueError("Select one image variant before processing.")
+                from .processing import available_beamhistory
+                if "corrections" in normalized_sections and available_beamhistory(row_config.get("corrections", {}).get("beamhistory_path")):
+                    from .inspection import processing_layout
+                    runs = processing_layout(dataset, products)["runs"]
+                    missing = [run["name"] for run in runs
+                               if not backends.nci_data().get_run_exposure_windows(run)]
+                    if missing:
+                        raise ValueError(f"Beam correction requires timing metadata; missing: {missing}")
             first = products[0].path
             with tifffile.TiffFile(first) as tif:
                 shape = tif.pages[0].shape
@@ -370,7 +445,8 @@ def validate_batch(
                     message=f"{len(dataset.runs)} run record(s), {len(products)} TIFF image(s)",
                     run_count=len(dataset.runs),
                     image_count=len(products),
-                    result_dir=proposal_root / "analysis" / dataset.experiment,
+                    result_dir=result_directory(analysis_root_for_proposal(proposal_root), dataset.experiment,
+                                                row_variant, row_project.get("analysis_name", "")),
                     input_signature=signature,
                     setup_like=is_setup_experiment(dataset.experiment),
                 )
@@ -383,7 +459,8 @@ def validate_batch(
                     message=f"{type(exc).__name__}: {exc}",
                     run_count=0,
                     image_count=0,
-                    result_dir=proposal_root / "analysis" / experiment,
+                    result_dir=result_directory(analysis_root_for_proposal(proposal_root), experiment,
+                                                row_variant, row_project.get("analysis_name", "")),
                     input_signature="",
                     setup_like=is_setup_experiment(experiment),
                 )
@@ -397,8 +474,8 @@ def validate_batch(
     )
 
 
-def _batch_dir(proposal_root, batch_name):
-    return proposal_root / "analysis" / "proposal_summary" / "batches" / batch_name
+def _batch_dir(proposal_root, batch_name, analysis_name=""):
+    return named_directory(analysis_root_for_proposal(proposal_root) / "batches" / batch_name, analysis_name)
 
 
 def _write_recipe(path, preset, config, report, batch_name, recipe_hash):
@@ -461,9 +538,12 @@ def save_batch_plan(report, *, preset, config, batch_name=""):
     saved_project["result_root"] = ""
     variant = str(saved_project.get("variant", "") or "")
     safe_name = _safe_batch_name(batch_name, variant)
-    target = _batch_dir(report.proposal_root, safe_name)
+    target = _batch_dir(report.proposal_root, safe_name, saved_project.get("analysis_name", ""))
+    # Dashboard visibility is recorded but cannot change scientific results.
     recipe_hash = _digest(
-        {"preset": preset, "config": saved_config, "sections": report.sections}
+        {"preset": preset,
+         "config": {key: value for key, value in saved_config.items() if key != "gui"},
+         "sections": report.sections}
     )
     recipe = target / "batch_recipe.ini"
     _write_recipe(recipe, preset, saved_config, report, safe_name, recipe_hash)
@@ -478,7 +558,7 @@ def save_batch_plan(report, *, preset, config, batch_name=""):
             failed_section="",
             started_at="",
             finished_at="",
-            config_path=row.result_dir / "lumacam_pipeline.ini",
+            config_path=snapshot_path(row.result_dir),
             results_dir=row.result_dir,
             recipe_hash=recipe_hash,
         )
@@ -488,28 +568,68 @@ def save_batch_plan(report, *, preset, config, batch_name=""):
     return target
 
 
-def _reference_source_files(reference_path, variant):
+def _reference_source_files(reference_path, variant, final_subfolder="final"):
+    """Use the same individual inputs as reference loading, including exclusions."""
+    from .products import is_all_runs_sum
     reference = Path(reference_path).expanduser().resolve()
     if reference.is_file():
+        if is_all_runs_sum(reference):
+            raise ValueError(f"All-runs sum is a preview, not an individual OB input: {reference}")
         return [reference]
+    module = backends.nci_data()
+    layout = module.resolve_nci_experiment(str(reference), final_subfolder=final_subfolder)
+    return sorted({Path(path) for run in layout["runs"]
+        for path in module._run_image_paths(run, file_filter=variant or None)})
+
+
+def _input_files(path_value):
+    """Return deterministic non-hidden files represented by one path."""
+
+    if path_value is None or not str(path_value).strip():
+        return []
+    path = Path(path_value).expanduser()
+    if path.is_file():
+        return [path]
+    if not path.is_dir():
+        return []
     return [
-        path
-        for path in reference.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in {".tif", ".tiff"}
-        and (not variant or variant in str(path))
+        candidate
+        for candidate in sorted(path.rglob("*"))
+        if candidate.is_file()
+        and not any(part.startswith(".") for part in candidate.relative_to(path).parts)
     ]
 
 
+def _reuse_shared(image_path, metadata_path, settings):
+    if not image_path.exists() and not metadata_path.exists():
+        return False
+    if image_path.is_file() and metadata_path.is_file():
+        saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if all(saved.get(key) == value for key, value in settings.items()):
+            return True
+    raise ValueError(
+        f"Shared corrections at {image_path.parent} use different inputs/settings or are incomplete. "
+        "Choose a new Preparation name (Reference set) in Prepare OB/BG files; existing files are preserved."
+    )
+
+
 def _prepare_shared_reference(proposal_root, config, log_path):
+    from .processing import prepare_reference_timing
+    prepare_reference_timing(config)
     corrections = config.setdefault("corrections", {})
+    if uses_prepared_ob(corrections):
+        value = str(corrections.get("prepared_reference_path", "") or "").strip()
+        return validate_prepared_ob(value) if value else None
     reference_value = str(corrections.get("reference_dir", "") or "").strip()
     if not reference_value:
         corrections.pop("prepared_reference_path", None)
         return None
     reference = Path(reference_value).expanduser().resolve()
     variant = str(corrections.get("file_filter") or config.get("project", {}).get("variant", ""))
-    source_files = _reference_source_files(reference, variant)
+    source_files = _reference_source_files(reference, variant,
+        str(corrections.get("reference_final_subfolder", "final")))
+    if not source_files:
+        raise ValueError(f"No individual reference TIFF inputs for variant {variant!r}: {reference}")
     # Exclusions/timing can change without any TIFF changing. Include the
     # sidecars in the cache key so excluded reference counts cannot be reused.
     reference_metadata = []
@@ -528,6 +648,7 @@ def _prepare_shared_reference(proposal_root, config, log_path):
                 )
     signature = _path_signature(source_files)
     settings = {
+        "input_policy": "individual-runs-only-v1",
         "reference": str(reference),
         "variant": variant,
         "reference_bin_y": int(corrections.get("reference_bin_y", 2)),
@@ -543,18 +664,13 @@ def _prepare_shared_reference(proposal_root, config, log_path):
         "source_signature": signature,
         "metadata_signature": _path_signature(reference_metadata),
     }
-    reference_beam_path = Path(settings["reference_beamhistory_path"]).expanduser()
-    settings["reference_beamhistory_signature"] = (
-        _path_signature([reference_beam_path])
-        if settings["reference_beamhistory_path"] and reference_beam_path.is_file()
-        else []
+    settings["reference_beamhistory_signature"] = _path_signature(
+        _input_files(settings["reference_beamhistory_path"])
     )
-    cache_key = _digest(settings)[:16]
-    cache_dir = proposal_root / "analysis" / "proposal_summary" / "reference_cache" / cache_key
-    safe_variant = re.sub(r"[^A-Za-z0-9._-]+", "_", variant).strip("._-") or "default"
-    cache_path = cache_dir / f"processed_reference_{safe_variant}.tiff"
-    metadata_path = cache_dir / "reference_cache.json"
-    if cache_path.is_file() and metadata_path.is_file():
+    cache_dir = shared_directory(proposal_root, config)
+    cache_path = cache_dir / "ob.tiff"
+    metadata_path = cache_dir / "ob_preparation.json"
+    if _reuse_shared(cache_path, metadata_path, settings):
         corrections["prepared_reference_path"] = str(cache_path)
         return cache_path
 
@@ -598,9 +714,16 @@ def _prepare_shared_reference(proposal_root, config, log_path):
 
 
 def _prepare_reference_integral(config, log_path):
+    from .processing import prepare_reference_timing
+    prepare_reference_timing(config)
     corrections = config.setdefault("corrections", {})
     if corrections.get("reference_beam_integral_per_minute") not in (None, ""):
         return corrections["reference_beam_integral_per_minute"]
+    if uses_prepared_ob(corrections):
+        value = str(corrections.get("prepared_reference_path", "") or "").strip()
+        integral = prepared_ob_integral(value) if value else None
+        corrections["reference_beam_integral_per_minute"] = integral
+        return integral
     reference = str(corrections.get("reference_dir", "") or "").strip()
     reference_beam = str(corrections.get("reference_beamhistory_path", "") or "").strip()
     experiment_beam = str(corrections.get("beamhistory_path", "") or "").strip()
@@ -617,12 +740,316 @@ def _prepare_reference_integral(config, log_path):
     return value
 
 
+def prepare_shared_ob_background(
+    data_path,
+    ob_experiment,
+    background_experiment="",
+    *,
+    preset="exsitu",
+    config=None,
+    prepare_background=None,
+):
+    """Prepare shared OB, optionally also a separate shared BG.
+
+    Explicit first_frames mode needs only OB. Older callers without a mode
+    retain the original OB-and-BG preparation behavior.
+    """
+
+    values = config if config is not None else {}
+    if prepare_background is None:
+        background_config = values.get("background", {})
+        raw_mode = str(background_config.get("source_mode", "auto") or "auto").strip().lower()
+        prepare_background = raw_mode == "auto" or resolve_background_source(background_config) == "shared"
+    background_n_images = background_frame_count(values.get("background", {})) if prepare_background else None
+    proposal_root, layout_root = _proposal_paths(data_path)
+    available = list_experiments(layout_root)
+    ob_name = resolve_experiment_name(str(ob_experiment).strip(), available)
+    background_name = (resolve_experiment_name(str(background_experiment).strip(), available)
+                       if prepare_background else "")
+    if prepare_background and ob_name == background_name:
+        raise ValueError("OB and background experiments must be different.")
+
+    project = values.setdefault("project", {})
+    variant = str(project.get("variant", "") or "").strip()
+    if not variant:
+        raise ValueError("Select a TIFF variant before preparing shared OB and background.")
+    project["data_path"] = str(Path(data_path).expanduser())
+
+    ob_dataset = discover_dataset(data_path, experiment=ob_name, variant=variant)
+    background_dataset = discover_dataset(
+        data_path, experiment=background_name, variant=variant
+    ) if prepare_background else None
+    ob_products = ob_dataset.image_products(
+        variant=variant, kinds=("final",), include_aggregates=False
+    )
+    background_products = background_dataset.image_products(
+        variant=variant, kinds=("final",), include_aggregates=False
+    ) if prepare_background else []
+    if not ob_products:
+        raise ValueError(f"No per-run OB TIFFs found for {ob_name!r}, variant {variant!r}.")
+    if prepare_background and not background_products:
+        raise ValueError(
+            f"No per-run background TIFFs found for {background_name!r}, variant {variant!r}."
+        )
+
+    reference_source = layout_root / "final" / ob_name
+    background_source = layout_root / "final" / background_name
+    if not reference_source.is_dir() or (prepare_background and not background_source.is_dir()):
+        raise ValueError(
+            "Shared OB/background preparation requires a LumaCam proposal with "
+            "final/<experiment> folders."
+        )
+
+    shared_root = shared_directory(proposal_root, values)
+    shared_root.mkdir(parents=True, exist_ok=True)
+    log_path = shared_root / "preparation.log"
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"{_now()} preparing OB={ob_name}, background={background_name}, "
+            f"variant={variant}\n"
+        )
+
+    corrections = values.setdefault("corrections", {})
+    corrections["enabled"] = True
+    corrections["reference_input_mode"] = "source"
+    corrections["reference_dir"] = str(reference_source)
+    corrections["file_filter"] = variant
+    # The shared routine always uses the same history for OB, BG, and samples.
+    # Keep the backend key for compatibility with older single-experiment configs.
+    corrections["reference_beamhistory_path"] = corrections.get("beamhistory_path", "")
+    corrections.pop("prepared_reference_path", None)
+    corrections.pop("reference_beam_integral_per_minute", None)
+    reference_integral = _prepare_reference_integral(values, log_path)
+    prepared_reference = _prepare_shared_reference(proposal_root, values, log_path)
+    if prepared_reference is None:
+        raise ValueError("Shared OB preparation did not produce a reference image.")
+    reference_metadata_path = prepared_reference.parent / "ob_preparation.json"
+    try:
+        reference_metadata = json.loads(reference_metadata_path.read_text(encoding="utf-8"))
+        reference_count = int(reference_metadata.get("source_count", len(ob_products)))
+    except (OSError, ValueError, json.JSONDecodeError):
+        reference_count = len(ob_products)
+
+    if not prepare_background:
+        values.setdefault("shared_setup", {}).update({
+            "ob_experiment": ob_name,
+            "reference_source_path": str(reference_source),
+            "prepared_reference_path": str(prepared_reference),
+            "reference_tiff_count": reference_count,
+        })
+        return SharedPreparationResult(
+            proposal_root=proposal_root, ob_experiment=ob_name, background_experiment="",
+            reference_source_path=reference_source, prepared_reference_path=prepared_reference,
+            reference_tiff_count=reference_count,
+            reference_beam_integral_per_minute=(float(reference_integral) if reference_integral is not None else None),
+            background_source_path=None, corrected_background_dir=None, prepared_background_path=None,
+            background_source_tiff_count=0, background_tiff_count=0,
+            metadata_path=reference_metadata_path, reused_background_cache=False,
+        )
+    background_metadata_files = []
+    for run in background_dataset.runs:
+        if run.metadata_dir and run.metadata_dir.is_dir():
+            background_metadata_files.extend(run.metadata_dir.glob("*.json"))
+    background_settings = {
+        "background_experiment": background_name,
+        "background_source_signature": _path_signature(
+            [product.path for product in background_products]
+        ),
+        "background_metadata_signature": _path_signature(background_metadata_files),
+        "beam_history_signature": _path_signature(
+            _input_files(corrections.get("beamhistory_path", ""))
+        ),
+        "prepared_reference_path": str(prepared_reference),
+        "reference_beam_integral_per_minute": reference_integral,
+        "background_n_images": background_n_images,
+        "variant": variant,
+    }
+    cache_dir = shared_root
+    prepared_background = cache_dir / "background.tiff"
+    metadata_path = cache_dir / "preparation.json"
+    reused_background_cache = _reuse_shared(prepared_background, metadata_path, background_settings)
+
+    corrected_background_dir = result_directory(cache_dir / "processing" / "work", background_name, variant) / "processing" / "intermediate" / "beam_ob_corrected"
+    background_count = 0
+    if reused_background_cache:
+        try:
+            background_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            corrected_background_dir = Path(background_metadata["corrected_background_dir"])
+            background_count = int(background_metadata["background_tiff_count"])
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            reused_background_cache = False
+
+    if not reused_background_cache:
+        background_config = deepcopy(values)
+        background_config.setdefault("background", {})["enabled"] = True
+        background_config.setdefault("project", {}).update(
+            {
+                "data_path": str(Path(data_path).expanduser()),
+                "experiment": background_name,
+                "variant": variant,
+                "result_root": str(cache_dir / "processing" / "work"),
+                "analysis_name": "",
+                "include_aggregates": False,
+            }
+        )
+        background_config.setdefault("corrections", {}).update(
+            {
+                "enabled": True,
+                "reference_dir": str(reference_source),
+                "prepared_reference_path": str(prepared_reference),
+                "reference_beam_integral_per_minute": reference_integral,
+                "file_filter": variant,
+            }
+        )
+        session = create_session(preset, background_config)
+        project_outcome = session.run("project")
+        if project_outcome.state != SectionState.COMPLETED:
+            raise ValueError(f"Background discovery failed: {project_outcome.message}")
+        correction_outcome = session.run("corrections")
+        if correction_outcome.state != SectionState.COMPLETED:
+            raise ValueError(f"Background correction failed: {correction_outcome.message}")
+        corrected_background_dir = Path(
+            session.artifacts.require("processed_image_dir")
+        )
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        calculation_metadata_path = cache_dir / "background_calculation.json"
+        background_image = backends.nci_data().compute_background_image(
+            str(corrected_background_dir),
+            n_images=background_n_images,
+            compute_dtype=np.float32,
+            metadata_path=str(calculation_metadata_path),
+        )
+        tifffile.imwrite(prepared_background, np.asarray(background_image, dtype=np.float32))
+        try:
+            calculation_metadata = json.loads(
+                calculation_metadata_path.read_text(encoding="utf-8")
+            )
+            background_count = int(
+                calculation_metadata["sections"]["background_processing"]
+                ["background_image"]["extra"]["valid_images_used"]
+            )
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            background_count = min(background_n_images, len(background_products))
+        metadata_path.write_text(
+            json.dumps(
+                {
+                    **background_settings,
+                    "ob_experiment": ob_name,
+                    "reference_source_path": str(reference_source),
+                    "reference_tiff_count": reference_count,
+                    "background_source_path": str(background_source),
+                    "background_source_tiff_count": len(background_products),
+                    "background_tiff_count": background_count,
+                    "corrected_background_dir": str(corrected_background_dir),
+                    "prepared_background_path": str(prepared_background),
+                    "created_at": _now(),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"{_now()} prepared shared background from {background_count} TIFF(s): "
+                f"{prepared_background}\n"
+            )
+
+    background = values.setdefault("background", {})
+    background.update(
+        {
+            "enabled": True,
+            "source_mode": "shared",
+            "background_path": str(prepared_background),
+            "n_images": background_n_images,
+        }
+    )
+    shared_setup = values.setdefault("shared_setup", {})
+    shared_setup.update(
+        {
+            "ob_experiment": ob_name,
+            "background_experiment": background_name,
+            "reference_source_path": str(reference_source),
+            "prepared_reference_path": str(prepared_reference),
+            "reference_tiff_count": reference_count,
+            "prepared_background_path": str(prepared_background),
+            "background_source_tiff_count": len(background_products),
+            "background_tiff_count": background_count,
+            "metadata_path": str(metadata_path),
+        }
+    )
+    return SharedPreparationResult(
+        proposal_root=proposal_root,
+        ob_experiment=ob_name,
+        background_experiment=background_name,
+        reference_source_path=reference_source,
+        prepared_reference_path=prepared_reference,
+        reference_tiff_count=reference_count,
+        reference_beam_integral_per_minute=(
+            float(reference_integral) if reference_integral is not None else None
+        ),
+        background_source_path=background_source,
+        corrected_background_dir=corrected_background_dir,
+        prepared_background_path=prepared_background,
+        background_source_tiff_count=len(background_products),
+        background_tiff_count=background_count,
+        metadata_path=metadata_path,
+        reused_background_cache=reused_background_cache,
+    )
+
+
 def _sentinel_matches(path, job_hash):
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
     return payload.get("job_hash") == job_hash and payload.get("status") == "completed"
+
+
+def _relocated_sentinel_matches(path, config_path, input_signature, sections, preset, config):
+    """A verified move or retired GUI mode can change hashes without changing science."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (payload.get("status") != "completed"
+                or payload.get("input_signature") != input_signature
+                or tuple(payload.get("sections", ())) != tuple(sections)):
+            return False
+        from .config import load_config
+        old_preset, saved = load_config(config_path)
+        renamed_mode = LEGACY_MODE_ALIASES.get(old_preset) == preset
+        if (payload.get("relocated_config_snapshot") != str(config_path) and not renamed_mode):
+            return False
+        if old_preset != preset and not renamed_mode:
+            return False
+        previous = create_session(old_preset, saved).config
+        current = create_session(preset, config).config
+        if renamed_mode:
+            previous["average"].setdefault("collect_in_proposal", False)
+            current["average"].setdefault("collect_in_proposal", False)
+        previous["background"] = effective_background_settings(previous["background"])
+        current["background"] = effective_background_settings(current["background"])
+        previous["images"] = effective_image_settings(previous["images"])
+        current["images"] = effective_image_settings(current["images"])
+        for key in ("variant", "product_kinds", "include_aggregates"):
+            if previous["project"].get(key) != current["project"].get(key):
+                return False
+        for section in sections:
+            if section == "project":
+                continue
+            ignored = {"enabled", "verbose", "recompute"}
+            old = {key: value for key, value in previous.get(section, {}).items() if key not in ignored}
+            new = {key: value for key, value in current.get(section, {}).items() if key not in ignored}
+            if old != new:
+                return False
+        if "average" in sections:
+            project = current["project"]
+            filename = current["average"].get("filename") or average_filename(
+                project["experiment"], project.get("variant", ""), project.get("analysis_name", ""))
+            if not (config_path.parent.parent / "images" / filename).is_file():
+                return False
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def run_batch(
@@ -643,7 +1070,8 @@ def run_batch(
     base_config = deepcopy(config or {})
     base_config.setdefault("project", {})["data_path"] = str(Path(data_path).expanduser())
     base_config["project"]["result_root"] = ""
-    base_config.setdefault("corrections", {}).pop("prepared_reference_path", None)
+    if not uses_prepared_ob(base_config.setdefault("corrections", {})):
+        base_config["corrections"].pop("prepared_reference_path", None)
     report = validate_batch(
         data_path,
         experiments,
@@ -660,7 +1088,7 @@ def run_batch(
 
     variant = str(base_config["project"].get("variant", "") or "")
     safe_name = _safe_batch_name(batch_name, variant)
-    batch_dir = _batch_dir(report.proposal_root, safe_name)
+    batch_dir = _batch_dir(report.proposal_root, safe_name, base_config["project"].get("analysis_name", ""))
     batch_dir.mkdir(parents=True, exist_ok=True)
     recipe_path = batch_dir / "batch_recipe.ini"
     status_path = batch_dir / "batch_status.csv"
@@ -674,8 +1102,16 @@ def run_batch(
     if "corrections" in report.sections:
         _prepare_reference_integral(base_config, log_path)
         _prepare_shared_reference(report.proposal_root, base_config, log_path)
+    # Toggling the advanced view must not invalidate completed batch jobs.
+    hash_config = {key: value for key, value in base_config.items() if key != "gui"}
+    if "background" in hash_config:
+        hash_config["background"] = effective_background_settings(hash_config["background"])
+    if "images" in hash_config:
+        hash_config["images"] = effective_image_settings(hash_config["images"])
     recipe_hash = _digest(
-        {"preset": preset, "config": base_config, "sections": report.sections}
+        {"preset": preset,
+         "config": hash_config,
+         "sections": report.sections}
     )
     _write_recipe(recipe_path, preset, base_config, report, safe_name, recipe_hash)
 
@@ -687,7 +1123,7 @@ def run_batch(
             "",
             "",
             "",
-            row.result_dir / "lumacam_pipeline.ini",
+            snapshot_path(row.result_dir),
             row.result_dir,
             recipe_hash,
         )
@@ -721,9 +1157,13 @@ def run_batch(
                 "override_hash": override_hash,
             }
         )
-        config_path = row.result_dir / "lumacam_pipeline.ini"
+        config_path = snapshot_path(row.result_dir)
         sentinel = row.result_dir / "processing" / f"batch_{safe_name}.json"
-        if not overwrite and _sentinel_matches(sentinel, job_hash):
+        if not overwrite and (
+            _sentinel_matches(sentinel, job_hash)
+            or _relocated_sentinel_matches(sentinel, config_path, row.input_signature,
+                                           report.sections, preset, experiment_config)
+        ):
             result = BatchJobResult(
                 row.experiment,
                 "skipped",
@@ -760,7 +1200,6 @@ def run_batch(
         message = "Completed selected sections."
         status = "failed"
         try:
-            save_config(config_path, preset, experiment_config)
             session = create_session(preset, experiment_config)
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(f"{started} [{row.experiment}] started\n")
@@ -777,6 +1216,7 @@ def run_batch(
                             break
             finished = _now()
             if not failed_section:
+                save_config(config_path, preset, session.config)
                 status = "completed"
                 sentinel.parent.mkdir(parents=True, exist_ok=True)
                 sentinel.write_text(
@@ -827,6 +1267,24 @@ def run_batch(
         handle.write(
             f"{_now()} batch {safe_name} stopped with {completed_count} finished result(s)\n"
         )
+    report_error = ""
+    if (base_config.get("workflow", {}).get("role") == "processing"
+            and base_config.get("reports", {}).get("enabled", True)):
+        from .handover import MANIFEST
+        from .reports import create_report
+        published = [result.results_dir for result in ordered_results()
+                     if (result.results_dir / MANIFEST).is_file()]
+        if published:
+            try:
+                create_report(published, output_dir=batch_dir, title=f"LumaCam batch: {safe_name}",
+                    notes=["Batch job status (a report is not evidence that every requested section completed):"] +
+                          [f"{result.experiment}: {result.status}; {result.message}" for result in ordered_results()])
+            except Exception as exc:
+                report_error = f"Batch overview failed; processing results retained: {type(exc).__name__}: {exc}"
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(report_error + "\n")
+                if progress:
+                    progress("report_failed", {"message": report_error})
     return BatchRunSummary(
         batch_name=safe_name,
         batch_dir=batch_dir,
@@ -834,6 +1292,7 @@ def run_batch(
         status_path=status_path,
         log_path=log_path,
         results=ordered_results(),
+        report_error=report_error,
     )
 
 
@@ -845,9 +1304,11 @@ __all__ = [
     "BatchRunSummary",
     "BatchValidationReport",
     "BatchValidationRow",
+    "SharedPreparationResult",
     "discover_batch_experiments",
     "is_setup_experiment",
     "normalize_batch_sections",
+    "prepare_shared_ob_background",
     "run_batch",
     "save_batch_plan",
     "validate_batch",

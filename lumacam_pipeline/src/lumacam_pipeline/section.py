@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any, Iterable, Mapping
 
 from .models import Artifact
+from .provenance import check_recipe, record_success
 
 
 class SectionState(str, Enum):
@@ -74,12 +75,14 @@ class PipelineSession:
         self,
         sections: Iterable[PipelineSection],
         config: Mapping[str, Mapping[str, Any]] | None = None,
+        *, preset="operando_nci",
     ) -> None:
         section_list = list(sections)
         self.sections = {section.id: section for section in section_list}
         if len(self.sections) != len(section_list):
             raise ValueError("Section ids must be unique")
         self.config = {name: dict(values) for name, values in (config or {}).items()}
+        self.preset = preset
         self.artifacts = ArtifactStore()
         self.outcomes: dict[str, SectionOutcome] = {}
 
@@ -130,6 +133,11 @@ class PipelineSession:
     def run(self, section_id: str) -> SectionOutcome:
         if section_id not in self.sections:
             raise KeyError(f"Unknown section: {section_id}")
+        if self.config.get("workflow", {}).get("role") == "processing":
+            from .processing import PROCESSING_SECTIONS
+            if section_id not in PROCESSING_SECTIONS:
+                return SectionOutcome(section_id, SectionState.FAILED,
+                                      "Use the analysis/visualization notebook for this section.")
         section = self.sections[section_id]
         config = self.section_config(section_id)
         if not section.is_configured(config):
@@ -146,14 +154,19 @@ class PipelineSession:
             self.outcomes[section_id] = outcome
             return outcome
         try:
+            check_recipe(self, section_id)
             outcome = section.run(self, config)
             if outcome.state == SectionState.COMPLETED:
                 self._invalidate_consumers(section.produces, excluded=(section_id,))
                 for name, value in outcome.outputs.items():
                     self.artifacts.put(name, value, section_id, **outcome.metadata)
+                record_success(self, section_id)
         except Exception as exc:
             outcome = SectionOutcome(section_id, SectionState.FAILED, f"{type(exc).__name__}: {exc}")
         self.outcomes[section_id] = outcome
+        if self.config.get("workflow", {}).get("role") in {"processing", "visualization"}:
+            from .reports import refresh_session_report
+            refresh_session_report(self, section_id, outcome)
         return outcome
 
     def summary(self) -> list[dict[str, Any]]:

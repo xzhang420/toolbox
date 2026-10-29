@@ -14,6 +14,9 @@ from ..section import PipelineSection, SectionOutcome, SectionState
 
 def _category_dir(session, category):
     output = Path(session.artifacts.require("results_dir")) / category
+    if (session.config.get("workflow", {}).get("role") == "visualization"
+            and session.config.get("visualization", {}).get("export_layout", "versioned") != "flat"):
+        output = output / session.artifacts.require("export_id")
     output.mkdir(parents=True, exist_ok=True)
     return output
 
@@ -150,6 +153,17 @@ class IndividualImagePlotSection(PipelineSection):
         )
 
 
+def _check_thickness_units(session, config):
+    """Do not place arbitrary image counts and EC micrometres on one value axis."""
+    traces = backends.nci_plots().normalize_thickness_traces(config.get("thickness_traces", "both"))
+    if (session.config.get("workflow", {}).get("role") == "visualization"
+            and {"nci", "echem"}.issubset(traces)
+            and not session.artifacts.get("nci_calibrated")
+            and str(session.artifacts.get("image_unit", "")).strip().casefold() not in {"um", "µm", "μm"}):
+        raise ValueError("Comparing image and EC thickness needs calibrated image values in µm. "
+                         "Do not relabel counts as thickness; deselect electrochemical thickness for an intensity plot.")
+
+
 class CombinedPlotSection(PipelineSection):
     id = "combined_plot"
     title = "Electrochemistry and image plot"
@@ -162,29 +176,117 @@ class CombinedPlotSection(PipelineSection):
         "experiment",
     )
     produces = ("combined_plot_path",)
+    optional_inputs = ("selected_image_indices", "event_context", "echem_thickness", "image_metric_label",
+                       "image_metrics_table", "measurement_columns", "measurement_labels", "view_window", "echem_current")
 
     def is_configured(self, config):
         return bool(config.get("enabled", True))
 
     def run(self, session, config):
+        _check_thickness_units(session, config)
         metric_label = session.artifacts.get("image_metric_label", "Image intensity")
+        from ..event_selection import selected_records
+        from ..time_window import bounds
+        window = bounds(session, "figures")
+        rows = selected_records(session, category="figures")
+        from ..measurements import method_names
+        requested = config.get("image_methods")
+        methods = method_names(requested) if requested else []
+        columns = session.artifacts.get("measurement_columns", {})
+        labels = session.artifacts.get("measurement_labels", {})
+        table = session.artifacts.get("image_metrics_table")
+        if any(method not in columns for method in methods):
+            raise ValueError("Calculate all requested plot methods with Measure images first.")
+        metric_values = session.artifacts.require("image_metric_values")
+        if methods:
+            metric_values = table[columns[methods[0]]].to_numpy()
+            metric_label = labels[methods[0]]
+        event_times = []
+        ec_times = session.artifacts.require("echem_times")
+        tolerance = float(config.get("marker_tolerance_seconds", 90))
+        for row in rows:
+            stamp = row["time"]
+            matched = stamp is not None and min(ec_times) <= stamp <= max(ec_times)
+            if matched:
+                matched = min(abs((time-stamp).total_seconds()) for time in ec_times) <= tolerance
+            event_times.append(stamp if matched else None)
         figure = backends.nci_plots().plot_potential_and_thickness(
             session.artifacts.require("echem_times"),
             session.artifacts.require("echem_potential"),
             echem_thickness_series=session.artifacts.get("echem_thickness"),
             img_datetime_series=session.artifacts.require("image_times"),
-            avg_thickness_series=session.artifacts.require("image_metric_values"),
+            avg_thickness_series=metric_values,
             plot_thickness=True,
-            potential_ylim=config.get("potential_ylim"),
+            potential_ylim=config.get("potential_ylim") or None,
             pause_gap_minutes=float(config.get("pause_gap_minutes", 5)),
             thickness_traces=str(config.get("thickness_traces", "both")),
             thickness_layout=str(config.get("thickness_layout", "separate")),
             thickness_axis_label=metric_label,
-            nci_trace_label=str(config.get("image_trace_label", metric_label)),
+            nci_trace_label=metric_label if methods else str(config.get("image_trace_label", metric_label)),
+            event_times=event_times,
+            event_labels=[row["label"] for row in rows],
+            event_marker_size=5,
+            event_label_fontsize=12,
             show=False,
+            current_series=session.artifacts.get("echem_current") if config.get("show_current", True) else None,
+            image_gap_minutes=float(config.get("image_gap_minutes", 5)),
         )
         path = _category_dir(session, "figures") / f"electrochemistry_images_{session.artifacts.require('experiment')}.png"
-        figure.savefig(path, dpi=int(config.get("dpi", 300)), bbox_inches="tight")
+        import matplotlib.pyplot as plt
+        try:
+            if config.get("clean_layout", True):
+                # The potential axis already labels this single trace. Its
+                # automatic legend can otherwise cover the first event label.
+                figure.axes[0].set_title("")
+                legend = figure.axes[0].get_legend()
+                if legend is not None:
+                    legend.remove()
+            # Same letter on the actual image measurement; no interpolated NCI value.
+            traces = backends.nci_plots().normalize_thickness_traces(config.get("thickness_traces", "both"))
+            times = session.artifacts.require("image_times")
+            if "nci" in traces and len(methods) > 1:
+                axis = figure.axes[1]
+                pauses = backends.nci_plots().find_paused_intervals(times,
+                    min_gap_minutes=float(config.get("image_gap_minutes", 5)))
+                for number, method in enumerate(methods[1:]):
+                    x, y = backends.nci_plots().build_datetime_series_with_pauses(
+                        times, table[columns[method]].to_numpy(), pauses, min(times))
+                    axis.plot(x, y, label=labels[method], lw=1.2,
+                              color=("#9467bd", "#d62728", "#17becf", "#8c564b")[number])
+                axis.set_ylabel("Thickness (µm)" if session.artifacts.get("nci_calibrated") or
+                    session.artifacts.get("image_unit") in {"um", "µm", "μm"} else "Image value")
+                # Keep a multi-method legend outside the data area: automatic
+                # placement can obscure event markers near the curve minima.
+                axis.legend(loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0)
+            if window:
+                left, right = [(stamp-min(times)).total_seconds()/3600 for stamp in window]
+                if right <= left:
+                    raise ValueError("A curve zoom needs a nonzero time range.")
+                for axis in figure.axes:
+                    axis.set_xlim(left, right)
+                    # Pause labels were computed on the full record. Do not let
+                    # off-window text expand the saved figure's bounding box.
+                    for text in axis.texts:
+                        text.set_clip_on(True)
+            if rows and "nci" in traces and str(config.get("thickness_layout", "separate")) == "separate":
+                times = session.artifacts.require("image_times")
+                values = metric_values
+                axis = figure.axes[1]
+                previous_hour, previous_offset = None, 6
+                span = max((max(times)-min(times)).total_seconds()/3600, 1e-9)
+                for row in rows:
+                    index = row["image_index"]
+                    hour = (times[index] - min(times)).total_seconds()/3600
+                    if np.isfinite(values[index]):
+                        close = previous_hour is not None and abs(hour-previous_hour) < .04*span
+                        offset = -17 if close and previous_offset > 0 else 6
+                        axis.plot(hour, values[index], "ko", ms=4)
+                        axis.annotate(row["label"], (hour, values[index]), xytext=(4, offset),
+                                      textcoords="offset points", fontsize=10, fontweight="bold")
+                        previous_hour, previous_offset = hour, offset
+            figure.savefig(path, dpi=int(config.get("dpi", 300)), bbox_inches="tight")
+        finally:
+            plt.close(figure)
         return SectionOutcome(self.id, SectionState.COMPLETED, f"Saved {path}", {"combined_plot_path": path})
 
 
@@ -315,19 +417,24 @@ class CombinedVideoSection(PipelineSection):
         "results_dir",
         "experiment",
     )
-    optional_inputs = ("image_metric_values", "image_metric_label", "echem_thickness")
+    optional_inputs = ("image_metric_values", "image_metric_label", "echem_thickness", "view_window")
     produces = ("combined_video_path",)
 
     def is_configured(self, config):
         return bool(config.get("enabled", False))
 
     def run(self, session, config):
+        if session.artifacts.has("image_metric_values"):
+            _check_thickness_units(session, config)
         path = _category_dir(session, "videos") / f"{session.artifacts.require('experiment')}_synchronized.mp4"
+        from ..visualization import _display_image
+        from ..time_window import bounds
+        display_images = [_display_image(image, config) for image in session.artifacts.require("image_stack")]
         backends.nci_plots().make_potential_image_video_uniform_time(
             session.artifacts.require("echem_times"),
             session.artifacts.require("echem_potential"),
             session.artifacts.require("image_times"),
-            session.artifacts.require("image_stack"),
+            display_images,
             str(path),
             echem_thickness_series=session.artifacts.get("echem_thickness"),
             avg_thickness_series=session.artifacts.get("image_metric_values"),
@@ -344,5 +451,14 @@ class CombinedVideoSection(PipelineSection):
             colorbar_label=str(config.get("colorbar_label") or session.artifacts.get("image_metric_label", "Image intensity")),
             cbar_n_ticks=int(config.get("colorbar_ticks", 5)),
             thickness_layout=str(config.get("thickness_layout", "overlay")),
+            thickness_traces=str(config.get("thickness_traces", "both")),
+            thickness_axis_label=session.artifacts.get("image_metric_label", "Image intensity"),
+            nci_trace_label=session.artifacts.get("image_metric_label", "Image intensity"),
+            limit_to_overlap=bool(config.get("limit_to_overlap", False)),
+            image_origin=str(config.get("image_origin", "lower")),
+            time_window=bounds(session, "videos"),
+            pause_gap_minutes=float(config.get('pause_gap_minutes',5)),
+            image_gap_minutes=float(config.get('image_gap_minutes',5)),
+            image_tolerance_seconds=float(config.get('image_tolerance_seconds',90)),
         )
         return SectionOutcome(self.id, SectionState.COMPLETED, f"Saved {path}", {"combined_video_path": path})

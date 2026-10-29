@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 import math
+from .event_selection import panel_label
 
 
 def _normalize_scalebar_length(scalebar_length, scale_label=None):
@@ -91,6 +92,8 @@ def plot_images(
     electrode_roi_label="electrode area",
     electrode_roi_color="cyan",
     electrode_roi_linewidth=1.0,
+    image_origin="lower",
+    panel_labels=None,
 ):
     original_img_series = list(img_series)
     img_series = np.asarray(img_series) / conv_thickness
@@ -243,7 +246,7 @@ def plot_images(
                 roi,
                 cmap=cmap,
                 extent=[x_min, x_max, y_min, y_max],
-                origin="lower",
+                origin=image_origin,
                 vmin=vmin,
                 vmax=vmax,
             )
@@ -258,7 +261,7 @@ def plot_images(
             text_func(
                 0.05,
                 0.95,
-                chr(97 + label_start + j),
+                panel_labels[j] if panel_labels is not None else panel_label(label_start + j),
                 transform=ax.transAxes,
                 fontsize=label_fontsize,
                 fontname=label_fontname,

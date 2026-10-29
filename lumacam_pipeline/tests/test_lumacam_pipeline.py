@@ -26,6 +26,7 @@ from lumacam_pipeline.gui import LumacamPipelineGUI  # noqa: E402
 from lumacam_pipeline.config import load_config, save_config  # noqa: E402
 from lumacam_pipeline.batch import (  # noqa: E402
     discover_batch_experiments,
+    prepare_shared_ob_background,
     run_batch,
     validate_batch,
 )
@@ -328,6 +329,7 @@ class GuiLayoutTests(unittest.TestCase):
 
     def test_dashboard_has_clickable_inline_term_definitions(self):
         gui = LumacamPipelineGUI("operando_nci")
+        gui.show_all_sections.value = True
 
         def walk(widget):
             yield widget
@@ -340,11 +342,52 @@ class GuiLayoutTests(unittest.TestCase):
             if isinstance(widget, gui.w.HTML)
             and "lumacam-term-help" in str(widget.value)
         ]
-        self.assertEqual(len(help_widgets), 9)
+        self.assertGreaterEqual(len(help_widgets), 10)
         self.assertTrue(all("<details" in widget.value for widget in help_widgets))
         self.assertTrue(all("<summary" in widget.value for widget in help_widgets))
         self.assertTrue(any("Frames/merge" in widget.value for widget in help_widgets))
         self.assertTrue(any("Missing artifacts" in widget.value for widget in help_widgets))
+
+    def test_section_status_can_be_folded_or_shown(self):
+        gui = LumacamPipelineGUI("operando_nci")
+        self.assertIsNone(gui.status_accordion.selected_index)
+        gui.status_accordion.selected_index = 0
+        self.assertEqual(gui.status_accordion.selected_index, 0)
+        self.assertIn("Section status", gui.status_accordion.get_title(0))
+
+    def test_shared_preparation_updates_proposal_main_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proposal, _, ob_name, _ = make_markerless_proposal(
+                root, experiment="exp001_OB", values=(2.0, 2.0)
+            )
+            _, _, background_name, _ = make_markerless_proposal(
+                root, experiment="exp002_BG", values=(0.5, 0.5)
+            )
+            gui = LumacamPipelineGUI("exsitu")
+            gui.data_path.value = str(proposal)
+            gui._data_selected(proposal)
+            gui.variant.value = "3to1000"
+            gui.shared_ob_experiment.value = "exp001"
+            gui.shared_background_experiment.value = "exp002"
+            gui.background_count.value = 2
+
+            gui._prepare_shared_inputs()
+
+            main_config = (
+                proposal / "analysis" / "lumacam_pipeline.ini"
+            )
+            self.assertTrue(main_config.is_file())
+            _, values = load_config(main_config)
+            self.assertEqual(values["shared_setup"]["ob_experiment"], ob_name)
+            self.assertEqual(
+                values["shared_setup"]["background_experiment"], background_name
+            )
+            self.assertTrue(Path(values["background"]["background_path"]).is_file())
+            self.assertTrue(values["background"]["enabled"])
+            self.assertIn("ready", gui.shared_status_html.value)
+            self.assertEqual(gui.config_path.value, str(main_config))
+        self.assertIn("<table", gui.status_html.value)
 
     def test_batch_selection_is_restored_into_selected_box_from_config(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -397,6 +440,23 @@ class GuiLayoutTests(unittest.TestCase):
             self.assertEqual(gui.data_path.value, str(selected.resolve()))
             self.assertEqual(gui.path_browser.widget.layout.display, "none")
 
+    def test_beam_history_browser_accepts_files_or_folders(self):
+        gui = LumacamPipelineGUI("operando_nci")
+
+        gui.beam_browse_btn.click()
+        self.assertEqual(gui.path_browser.mode, "either")
+        self.assertNotEqual(gui.path_browser.current_button.layout.display, "none")
+        self.assertEqual(gui.path_browser.current_button.description, "Use current folder")
+        gui.path_browser.hide()
+
+        gui.beam_path.value = "/example/shared_beamhistory"
+        gui.session.section_config("corrections")["reference_beamhistory_path"] = "/old/ob.csv"
+        gui._sync_config()
+        self.assertEqual(
+            gui.session.section_config("corrections")["reference_beamhistory_path"],
+            gui.beam_path.value,
+        )
+
     def test_data_browser_populates_experiment_and_variant_choices(self):
         with tempfile.TemporaryDirectory() as temporary:
             proposal, _, experiment, _ = make_markerless_proposal(
@@ -436,7 +496,7 @@ class GuiLayoutTests(unittest.TestCase):
                 ).is_file()
             )
 
-    def test_each_run_updates_an_experiment_specific_proposal_config(self):
+    def test_each_run_updates_the_proposal_main_config(self):
         with tempfile.TemporaryDirectory() as temporary:
             proposal, _, experiment, _ = make_markerless_proposal(
                 Path(temporary), experiment="exp401_GPE_Cell7Au"
@@ -447,11 +507,13 @@ class GuiLayoutTests(unittest.TestCase):
             gui.variant.value = "3to1000"
 
             gui._run("project")
-            experiment_root = proposal / "analysis" / experiment
-            automatic = experiment_root / "lumacam_pipeline.ini"
+            experiment_root = proposal / "analysis" / experiment / "3to1000"
+            automatic = (
+                proposal / "analysis" / "lumacam_pipeline.ini"
+            )
             self.assertTrue(automatic.is_file())
             preset, values = load_config(automatic)
-            self.assertEqual(preset, "nci_images_only")
+            self.assertEqual(preset, "operando_nci")
             self.assertEqual(values["project"]["experiment"], experiment)
 
             gui.frames_per_merge.value = 2
@@ -461,9 +523,52 @@ class GuiLayoutTests(unittest.TestCase):
             self.assertEqual(gui.config_path.value, str(automatic))
             self.assertIn(str(automatic), gui.proposal_config_html.value)
             self.assertEqual(gui.session.artifacts.require("results_dir"), experiment_root)
+            self.assertFalse((experiment_root / "lumacam_pipeline.ini").exists())
 
 
 class SectionIndependenceTests(unittest.TestCase):
+    def test_exsitu_average_copies_to_proposal_and_refreshes_by_variant(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            proposal, _, experiment, _ = make_markerless_proposal(
+                Path(temporary), values=(2.0, 4.0), variants=("3to1000", "5to1000")
+            )
+            session = create_session("exsitu", {
+                "project": {"data_path": str(proposal), "variant": "3to1000"},
+                "average": {"filename": "custom_average.tiff"},
+            })
+            self.assertEqual(session.run("project").state, SectionState.COMPLETED)
+            self.assertEqual(session.run("images").state, SectionState.COMPLETED)
+            outcome = session.run("average")
+            self.assertEqual(outcome.state, SectionState.COMPLETED, outcome.message)
+            source = session.artifacts.require("average_image_path")
+            copied = session.artifacts.require("average_collection_path")
+            self.assertEqual(copied, proposal / "analysis" / "proposal_summary"
+                             / "averaged_images" / f"average_{experiment}_3to1000.tiff")
+            self.assertEqual(source.read_bytes(), copied.read_bytes())
+            session.artifacts.put("image_stack", [np.full((6, 6), 9.0)], "images")
+            self.assertEqual(session.run("average").state, SectionState.COMPLETED)
+            np.testing.assert_allclose(tifffile.imread(copied), 9.0)
+            session.configure("project", variant="5to1000")
+            self.assertEqual(session.run("project").state, SectionState.COMPLETED)
+            self.assertEqual(session.run("images").state, SectionState.COMPLETED)
+            self.assertEqual(session.run("average").state, SectionState.COMPLETED)
+            self.assertNotEqual(session.artifacts.require("average_collection_path"), copied)
+            self.assertTrue(copied.exists())
+
+    def test_exsitu_average_collection_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            proposal, _, _, _ = make_markerless_proposal(Path(temporary))
+            session = create_session("exsitu", {
+                "project": {"data_path": str(proposal), "variant": "3to1000"},
+                "average": {"collect_in_proposal": False},
+            })
+            session.run("project")
+            session.run("images")
+            self.assertEqual(session.run("average").state, SectionState.COMPLETED)
+            self.assertIsNone(session.artifacts.require("average_collection_path"))
+            self.assertFalse((proposal / "analysis" / "proposal_summary"
+                              / "averaged_images").exists())
+
     def test_exsitu_images_and_average_do_not_require_echem_or_corrections(self):
         with tempfile.TemporaryDirectory() as temporary:
             image_dir = Path(temporary) / "sample"
@@ -479,6 +584,8 @@ class SectionIndependenceTests(unittest.TestCase):
             self.assertEqual(session.run("images").state, SectionState.COMPLETED)
             outcome = session.run("average")
             self.assertEqual(outcome.state, SectionState.COMPLETED)
+            self.assertIn("2 source TIFF(s)", outcome.message)
+            self.assertEqual(outcome.metadata["source_tiff_count"], 2)
             np.testing.assert_allclose(session.artifacts.require("average_image"), 3.0)
             average_path = session.artifacts.require("average_image_path")
             self.assertTrue(average_path.is_file())
@@ -514,7 +621,7 @@ class SectionIndependenceTests(unittest.TestCase):
             self.assertEqual(outcome.state, SectionState.COMPLETED, outcome.message)
             paths = session.artifacts.require("individual_image_plot_paths")
             self.assertEqual(len(paths), 2)
-            expected_parent = proposal / "analysis" / experiment / "figures" / "individual_images"
+            expected_parent = proposal / "analysis" / experiment / "3to1000" / "figures" / "individual_images"
             self.assertTrue(all(path.parent == expected_parent for path in paths))
             self.assertTrue(all(path.name.startswith(f"{experiment}_image_") for path in paths))
             self.assertTrue(all(path.is_file() for path in paths))
@@ -533,7 +640,7 @@ class SectionIndependenceTests(unittest.TestCase):
             self.assertFalse(result["intensity_corrected"])
             self.assertFalse(result["reference_corrected"])
             self.assertEqual(result["timing_sources"], ["acquisition_json"])
-            experiment_root = proposal / "analysis" / "exp001"
+            experiment_root = proposal / "analysis" / "exp001" / "3to1000"
             self.assertEqual(session.artifacts.require("results_dir"), experiment_root)
             self.assertEqual(Path(result["corrected_dir"]).parent, experiment_root / "images")
             self.assertEqual(Path(result["metadata_path"]).parent, experiment_root / "processing")
@@ -562,9 +669,9 @@ class PhotonHyperspectralTests(unittest.TestCase):
             np.testing.assert_allclose(cube[1], 3.0)
             histogram_path = session.artifacts.require("photon_histogram_path")
             self.assertTrue(histogram_path.is_file())
-            self.assertEqual(histogram_path.parent, proposal / "analysis" / experiment / "tables" / "photon_hyperspectral")
+            self.assertEqual(histogram_path.parent, proposal / "analysis" / experiment / "2to2" / "tables" / "photon_hyperspectral")
             feature_path = next(iter(session.artifacts.require("photon_feature_paths").values()))
-            self.assertEqual(feature_path.parent, proposal / "analysis" / experiment / "images" / "photon_hyperspectral")
+            self.assertEqual(feature_path.parent, proposal / "analysis" / experiment / "2to2" / "images" / "photon_hyperspectral")
             self.assertFalse((layout / "metadata" / "layout.json").exists())
 
 
@@ -603,13 +710,91 @@ class TimeOfFlightTests(unittest.TestCase):
             paths = session.artifacts.require("tof_feature_paths")
             self.assertIn("tof_band_10_to_20.tiff", paths)
             self.assertTrue(paths["tof_mean_axis_value.tiff"].is_file())
-            experiment_root = root / "analysis" / "derived_images"
+            experiment_root = root / "analysis" / "derived_images" / "default"
             self.assertEqual(paths["tof_mean_axis_value.tiff"].parent, experiment_root / "images" / "tof")
             self.assertEqual(session.artifacts.require("tof_spectrum_path").parent, experiment_root / "tables" / "tof")
             self.assertEqual(session.status("electrochemistry"), SectionState.NOT_CONFIGURED)
 
 
 class BatchProcessingTests(unittest.TestCase):
+    def test_shared_ob_and_background_are_prepared_once_and_recorded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proposal, _, sample, _ = make_markerless_proposal(
+                root, experiment="exp101_sample", values=(4.0,)
+            )
+            _, _, ob_name, _ = make_markerless_proposal(
+                root, experiment="exp001_OB", values=(2.0, 2.0)
+            )
+            _, _, background_name, _ = make_markerless_proposal(
+                root, experiment="exp002_BG", values=(0.5, 0.5)
+            )
+            config = {
+                "project": {
+                    "data_path": str(proposal),
+                    "variant": "3to1000",
+                    "product_kinds": "final",
+                },
+                "corrections": {
+                    "reference_bin_y": 1,
+                    "reference_bin_x": 1,
+                    "beamhistory_path": "",
+                    "reference_beamhistory_path": "",
+                },
+                "background": {"n_images": 2},
+            }
+
+            prepared = prepare_shared_ob_background(
+                proposal,
+                "exp001",
+                "exp002",
+                preset="exsitu",
+                config=config,
+            )
+
+            self.assertEqual(prepared.ob_experiment, ob_name)
+            self.assertEqual(prepared.background_experiment, background_name)
+            self.assertEqual(prepared.reference_tiff_count, 2)
+            self.assertEqual(prepared.background_source_tiff_count, 2)
+            self.assertEqual(prepared.background_tiff_count, 2)
+            self.assertTrue(prepared.prepared_reference_path.is_file())
+            self.assertTrue(prepared.prepared_background_path.is_file())
+            np.testing.assert_allclose(
+                tifffile.imread(prepared.prepared_reference_path), 2.0
+            )
+            np.testing.assert_allclose(
+                tifffile.imread(prepared.prepared_background_path), 0.25
+            )
+            self.assertEqual(config["shared_setup"]["ob_experiment"], ob_name)
+            self.assertEqual(
+                Path(config["background"]["background_path"]),
+                prepared.prepared_background_path,
+            )
+
+            summary = run_batch(
+                proposal,
+                (sample,),
+                preset="exsitu",
+                config=config,
+                sections=("corrections", "background", "images", "average"),
+                batch_name="prepared_shared_inputs",
+            )
+            self.assertEqual(summary.results[0].status, "completed")
+            average = (
+                proposal / "analysis" / sample / "3to1000" / "images" / f"average_{sample}_3to1000.tiff"
+            )
+            np.testing.assert_allclose(tifffile.imread(average), 1.75)
+            from lumacam_pipeline.average_collection import collect_completed_batch
+            collection = proposal / "analysis" / "proposal_summary" / "averaged_images"
+            copied = collection / f"average_{sample}_3to1000.tiff"
+            self.assertEqual(copied.read_bytes(), average.read_bytes())
+            # Older finished batches can be collected without processing images again.
+            copied.unlink()
+            self.assertEqual(collect_completed_batch(summary.status_path), [copied])
+            self.assertFalse(copied.exists())
+            collect_completed_batch(summary.status_path, apply=True)
+            self.assertEqual(copied.read_bytes(), average.read_bytes())
+
     def test_batch_validates_runs_resumes_and_reuses_one_reference_cache(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -671,14 +856,14 @@ class BatchProcessingTests(unittest.TestCase):
             self.assertEqual(recipe_values["batch"]["experiments"], [exp101, exp102])
             self.assertIn("individual_image_plots", recipe_values["batch"]["sections"])
             caches = list(
-                (proposal / "analysis" / "proposal_summary" / "reference_cache").glob(
-                    "*/processed_reference_3to1000.tiff"
+                (proposal / "analysis" / "shared_corrections").glob(
+                    "*/ob.tiff"
                 )
             )
             self.assertEqual(len(caches), 1)
             for experiment in (exp101, exp102):
-                experiment_root = proposal / "analysis" / experiment
-                config_path = experiment_root / "lumacam_pipeline.ini"
+                experiment_root = proposal / "analysis" / experiment / "3to1000"
+                config_path = experiment_root / "processing" / "config_used.ini"
                 self.assertTrue(config_path.is_file())
                 _, saved = load_config(config_path)
                 self.assertEqual(saved["project"]["experiment"], experiment)
@@ -739,6 +924,7 @@ class BatchProcessingTests(unittest.TestCase):
                         proposal
                         / "analysis"
                         / second
+                        / "3to1000"
                         / "figures"
                         / "individual_images"
                     ).glob("*.png")
